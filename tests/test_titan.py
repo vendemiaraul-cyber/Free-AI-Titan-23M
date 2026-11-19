@@ -30,7 +30,8 @@ class FakeTeacher:
 
 def make_brain(home: Path) -> titan.Brain:
     shutil.copy(ROOT / "TITAN.md", home / "TITAN.md")
-    cfg = titan.Config(home=home, model=TINY, auto_train=False, learn_steps=2, batch_size=2, web_fallback=False)
+    cfg = titan.Config(home=home, model=TINY, auto_train=False, learn_steps=2, batch_size=2, web_fallback=False,
+                       perchance_url="")  # keep tests offline
     b = titan.Brain(cfg)
     b.teacher = FakeTeacher()
     return b
@@ -153,6 +154,7 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(self.b.kb.find_exact("What's my cat called?").answer, "Miso")
         r = self.b.chat("/image a cat")
         self.assertEqual(r["image"]["mode"], "unconfigured")
+        self.assertEqual(titan.Config().perchance_url, "https://perchance.org/rg4m14ri")
 
     def test_animate_video(self):
         r = self.b.videos.generate("a red balloon", backend="animate", frames=6)
@@ -202,6 +204,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_routes(self):
         self.assertIn("Titan-23M", self.get("/"))
+        self.assertIn('src="https://perchance.org/rg4m14ri"', self.get("/"))
         h = json.loads(self.get("/v1/health"))
         self.assertEqual(h["teacher"], "gpt-oss-120b")
         self.assertIn("## Knowledge", self.get("/v1/knowledge"))

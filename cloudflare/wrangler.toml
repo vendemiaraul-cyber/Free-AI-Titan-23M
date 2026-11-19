@@ -17,8 +17,8 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
 TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
-# Your generator on perchance.org, e.g. "https://perchance.org/my-titan-images"
-PERCHANCE_URL = ""
+# Titan's image generator on perchance.org
+PERCHANCE_URL = "https://perchance.org/rg4m14ri"
 # Let anyone chat in the browser even when TITAN_API_KEY is set ("false" to require the key)
 PUBLIC_CHAT = "true"
 RECALL_THRESHOLD = "0.55"

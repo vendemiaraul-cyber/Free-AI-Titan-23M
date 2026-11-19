@@ -109,7 +109,8 @@ titan.py with Playwright:
 `{ "ok": true, "mode": "headless", "file": ".../outputs/image_....png", "image_url": "/outputs/image_....png" }`.
 
 Without Playwright, or on the Worker:
-`{ "ok": false, "mode": "browser", "url": "https://perchance.org/your-generator", "message": "..." }`.
+`{ "ok": false, "mode": "browser", "url": "https://perchance.org/rg4m14ri", "message": "..." }`.
+The browser UI embeds that generator in the Image tab and copies the prompt to your clipboard.
 
 `GET /v1/image/status` shows whether a generator is configured and headless mode is available.
 

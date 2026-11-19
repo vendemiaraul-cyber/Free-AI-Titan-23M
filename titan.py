@@ -60,6 +60,7 @@ __version__ = "1.0.0"
 NAME = "Free-AI-Titan-23M"
 USER_AGENT = f"{NAME}/{__version__} (+https://github.com/vendemiaraul-cyber/Free-AI-Titan-23M)"
 TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
+DEFAULT_PERCHANCE_URL = "https://perchance.org/rg4m14ri"  # Titan's image generator on perchance.org
 
 
 def log(*args: Any) -> None:
@@ -96,10 +97,10 @@ class Config:
     teacher_model: str = TEACHER_MODEL
     web_fallback: bool = True      # learn from Wikipedia if the cloud is unreachable
     # perchance image generator
-    perchance_url: str = ""        # TITAN_PERCHANCE_URL e.g. https://perchance.org/my-titan-images
+    perchance_url: str = DEFAULT_PERCHANCE_URL  # TITAN_PERCHANCE_URL to use a different generator
     perchance_prompt_selector: str = "#prompt, textarea, input[type=text]"
     perchance_negative_selector: str = "#negative"
-    perchance_button_selector: str = "#generateBtn, #generate, button"
+    perchance_button_selector: str = "#generateBtn, #generate, button:has-text('Generate'), button"
     perchance_timeout: int = 120
     # MCP servers to connect to (client side)
     mcp_servers: list = field(default_factory=list)
@@ -153,7 +154,7 @@ class Config:
         c.cf_api_token = e("TITAN_CF_API_TOKEN", "")
         c.teacher_model = e("TITAN_TEACHER_MODEL", TEACHER_MODEL)
         c.web_fallback = e("TITAN_WEB_FALLBACK", "1") != "0"
-        c.perchance_url = e("TITAN_PERCHANCE_URL", "")
+        c.perchance_url = e("TITAN_PERCHANCE_URL", DEFAULT_PERCHANCE_URL)
         c.perchance_prompt_selector = e("TITAN_PERCHANCE_PROMPT_SELECTOR", c.perchance_prompt_selector)
         c.perchance_negative_selector = e("TITAN_PERCHANCE_NEGATIVE_SELECTOR", c.perchance_negative_selector)
         c.perchance_button_selector = e("TITAN_PERCHANCE_BUTTON_SELECTOR", c.perchance_button_selector)
@@ -769,7 +770,7 @@ class PerchanceImageGenerator:
         url = self.cfg.perchance_url
         if not url:
             return {"ok": False, "mode": "unconfigured",
-                    "message": "Set TITAN_PERCHANCE_URL to your perchance.org generator (e.g. https://perchance.org/my-titan-images)."}
+                    "message": "Set TITAN_PERCHANCE_URL to your perchance.org generator (e.g. https://perchance.org/rg4m14ri)."}
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -1492,7 +1493,7 @@ button.go:disabled{opacity:.5;cursor:wait}
 label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
 .hint{font-size:13px;color:var(--muted)}.err{color:var(--err)}
 pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;flex:1;margin:0;font-size:13px}
-iframe{width:100%;height:520px;border:1px solid var(--line);border-radius:10px;background:#fff}
+iframe{width:100%;background:#fff}
 a{color:var(--accent)}
 </style>
 </head>
@@ -1520,6 +1521,12 @@ a{color:var(--accent)}
     <div class="hint" id="imgHint">Images come from your Perchance generator.</div>
   </div>
   <div class="out" id="imgOut"></div>
+  <div class="card">
+    <div class="hint">Your Perchance generator · <a id="pcLink" href="https://perchance.org/rg4m14ri" target="_blank" rel="noopener">open in a new tab</a></div>
+    <iframe id="pcFrame" src="https://perchance.org/rg4m14ri"
+      style="width:100%; max-width:700px; height:800px; border:0; border-radius:12px;"
+      loading="lazy" allow="clipboard-write" title="Titan's Perchance image generator"></iframe>
+  </div>
 </section>
 
 <section id="video">
@@ -1605,13 +1612,16 @@ $("#chatForm").onsubmit=async e=>{
 };
 
 // image
+api("/v1/image/status").then(s=>{ if(s.generator_url && s.generator_url!==$("#pcFrame").getAttribute("src")){
+  $("#pcFrame").src=s.generator_url; $("#pcLink").href=s.generator_url; } }).catch(()=>{});
 $("#imgGo").onclick=async()=>{
   const p=$("#imgPrompt").value.trim(); if(!p)return; const b=$("#imgGo"); b.disabled=true; $("#imgHint").textContent="Generating… (this can take a minute)";
   try{
     const r=await api("/v1/image",{prompt:p,negative_prompt:$("#imgNeg").value});
     if(r.image_url){$("#imgOut").innerHTML=`<img src="${esc(r.image_url)}" alt="${esc(p)}"><p class="hint"><a href="${esc(r.image_url)}" download>Download</a></p>`;$("#imgHint").textContent="Done.";}
-    else if(r.url){$("#imgHint").innerHTML=esc(r.message||"")+` <a href="${esc(r.url)}" target="_blank" rel="noopener">Open in a new tab</a>`;
-      $("#imgOut").innerHTML=`<p class="hint">Prompt to paste: <b>${esc(p)}</b></p><iframe src="${esc(r.url)}" title="Perchance generator"></iframe>`;}
+    else if(r.url){ let copied=false; try{await navigator.clipboard.writeText(p); copied=true}catch(e){}
+      $("#imgHint").innerHTML=esc(r.message||"")+(copied?" The prompt is on your clipboard.":"");
+      $("#imgOut").innerHTML=`<p class="hint">Prompt to paste: <b>${esc(p)}</b></p>`; $("#pcFrame").scrollIntoView({behavior:"smooth"});}
     else $("#imgHint").textContent=r.message||"No image.";
   }catch(err){$("#imgHint").innerHTML=`<span class="err">${esc(err.message)}</span>`} finally{b.disabled=false}
 };

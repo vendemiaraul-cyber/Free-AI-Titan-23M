@@ -1,7 +1,7 @@
 // Run with: node --test cloudflare/test/
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { parseEntries, searchEntries, upsertEntry, extractText, DEFAULT_MD } from "../src/index.js";
+import worker, { DEFAULT_PERCHANCE_URL, parseEntries, searchEntries, upsertEntry, extractText, DEFAULT_MD } from "../src/index.js";
 
 function fakeEnv(extra = {}) {
   const kv = new Map();
@@ -14,7 +14,6 @@ function fakeEnv(extra = {}) {
       put: async (k, v) => { kv.set(k, v); },
       list: async ({ prefix }) => ({ keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })) }),
     },
-    PERCHANCE_URL: "https://perchance.org/my-titan-images",
     ...extra,
   };
 }
@@ -71,7 +70,8 @@ test("knowledge merge, image, video, MCP and UI routes", async () => {
   const m = await (await worker.fetch(post("/v1/knowledge", { markdown: upsertEntry(DEFAULT_MD, "Hello", "Hi!", "seed") }), env, ctx)).json();
   assert.equal(m.added, 1);
   const img = await (await worker.fetch(post("/v1/image", { prompt: "a cat" }), env, ctx)).json();
-  assert.equal(img.url, "https://perchance.org/my-titan-images");
+  assert.equal(img.url, "https://perchance.org/rg4m14ri");
+  assert.equal(DEFAULT_PERCHANCE_URL, img.url);
   assert.equal((await worker.fetch(post("/v1/video", { prompt: "x" }), env, ctx)).status, 501);
   const tools = await (await worker.fetch(post("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list" }), env, ctx)).json();
   assert.ok(tools.result.tools.some((t) => t.name === "titan_chat"));

@@ -80,13 +80,14 @@ export TITAN_CF_ACCOUNT_ID=...    # Cloudflare dashboard → Workers AI
 export TITAN_CF_API_TOKEN=...     # token with Workers AI permission
 ```
 
-### Images: your Perchance generator
+### Images: Titan's Perchance generator
 
-Make your generator on perchance.org, then:
+Titan's image generator is **https://perchance.org/rg4m14ri**. It's the default, and the Image
+tab of the browser UI embeds it. For automatic images through the API and `/image`:
 
 ```bash
-export TITAN_PERCHANCE_URL=https://perchance.org/your-generator
 pip install playwright && playwright install chromium
+# export TITAN_PERCHANCE_URL=https://perchance.org/...   # only to use a different generator
 ```
 
 Titan opens the generator headlessly, types the prompt, clicks generate and saves the image to
@@ -130,7 +131,6 @@ or over HTTP at `http://127.0.0.1:8023/mcp` while `titan.py serve` runs.
 ```bash
 cd cloudflare
 npx wrangler kv namespace create KNOWLEDGE      # paste the id into wrangler.toml
-# set PERCHANCE_URL in wrangler.toml to your generator
 npx wrangler secret put TITAN_API_KEY           # optional, protects teach/knowledge/MCP
 npx wrangler secret put REPORT_WEBHOOK_URL      # optional, Discord/Slack webhook for automatic reports
 npx wrangler deploy
@@ -173,7 +173,7 @@ node --test cloudflare/test/*.test.mjs # the Worker, with fake AI + KV
 | `TITAN_CF_ACCOUNT_ID`, `TITAN_CF_API_TOKEN` | – | call Workers AI directly instead |
 | `TITAN_TEACHER_MODEL` | `@cf/openai/gpt-oss-120b` | the teacher |
 | `TITAN_WEB_FALLBACK` | `1` | learn from Wikipedia when the cloud is down |
-| `TITAN_PERCHANCE_URL` (+ `_PROMPT/_NEGATIVE/_BUTTON_SELECTOR`) | – | your Perchance generator |
+| `TITAN_PERCHANCE_URL` (+ `_PROMPT/_NEGATIVE/_BUTTON_SELECTOR`) | `https://perchance.org/rg4m14ri` | the Perchance image generator |
 | `TITAN_MCP_SERVERS` | – | comma-separated MCP server URLs to connect to |
 | `TITAN_CONF_THRESHOLD`, `TITAN_SIM_THRESHOLD` | `0.75`, `0.30` | when Titan counts as unable to elaborate |
 | `TITAN_LEARN_STEPS`, `TITAN_BOOTSTRAP_STEPS`, `TITAN_BATCH_SIZE` | `30`, `300`, `8` | training amounts |

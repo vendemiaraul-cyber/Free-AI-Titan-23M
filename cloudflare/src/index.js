@@ -15,6 +15,8 @@ const NAME = "Free-AI-Titan-23M";
 const VERSION = "1.0.0";
 const MD_KEY = "titan.md";
 const DEFAULT_TEACHER = "@cf/openai/gpt-oss-120b";
+export const DEFAULT_PERCHANCE_URL = "https://perchance.org/rg4m14ri"; // Titan's image generator
+const perchanceUrl = (env) => env.PERCHANCE_URL || DEFAULT_PERCHANCE_URL;
 const UA = `${NAME}/${VERSION}`;
 
 export const DEFAULT_MD = `# TITAN.md — Knowledge of Free-AI-Titan-23M
@@ -233,7 +235,7 @@ async function chat(env, ctx, message) {
       const res = await webSearch(arg);
       return { reply: res.results.map((r) => `• ${r.title}: ${r.snippet.slice(0, 300)} ${r.url}`).join("\n") || "No results.", source: "web", notices: [], search: res };
     }
-    if (cmd === "/image") return { reply: env.PERCHANCE_URL ? `Open your Perchance generator and use this prompt: ${arg}` : "No Perchance generator configured (set PERCHANCE_URL).", source: "perchance", notices: [], image: imageInfo(env, arg) };
+    if (cmd === "/image") return { reply: `Open Titan's Perchance generator (${perchanceUrl(env)}) and use this prompt: ${arg}`, source: "perchance", notices: [], image: imageInfo(env, arg) };
     if (cmd === "/teach") {
       if (!arg.includes("|")) return { reply: "Usage: /teach question | answer", source: "command", notices: [] };
       const [q, a] = arg.split("|", 2).map((s) => s.trim());
@@ -259,9 +261,7 @@ async function chat(env, ctx, message) {
 }
 
 function imageInfo(env, prompt) {
-  return env.PERCHANCE_URL
-    ? { ok: false, mode: "browser", url: env.PERCHANCE_URL, prompt, message: "Your Perchance generator makes the image: paste the prompt there." }
-    : { ok: false, mode: "unconfigured", message: "Set PERCHANCE_URL in wrangler.toml to your perchance.org generator." };
+  return { ok: false, mode: "browser", url: perchanceUrl(env), prompt, message: "Titan's Perchance generator makes the image: paste the prompt there." };
 }
 
 // ---------------------------------------------------------------------------
@@ -340,12 +340,12 @@ export default {
         if (path === "/v1/health") {
           const es = parseEntries(await getMd(env));
           return json({ ok: true, name: NAME, version: VERSION, edition: "Cloudflare", knowledge_entries: es.length,
-            teacher: (env.TEACHER_MODEL || DEFAULT_TEACHER).split("/").pop(), perchance_url: env.PERCHANCE_URL || null });
+            teacher: (env.TEACHER_MODEL || DEFAULT_TEACHER).split("/").pop(), perchance_url: perchanceUrl(env) });
         }
         if (path === "/v1/knowledge")
           return new Response(await getMd(env), { headers: { "Content-Type": "text/markdown; charset=utf-8", ...CORS } });
         if (path === "/v1/video/backends") return json({ backends: VIDEO_BACKENDS });
-        if (path === "/v1/image/status") return json({ backend: "perchance", generator_url: env.PERCHANCE_URL || null, configured: !!env.PERCHANCE_URL, headless: false });
+        if (path === "/v1/image/status") return json({ backend: "perchance", generator_url: perchanceUrl(env), configured: true, headless: false });
         if (!authorized(request, env, path)) return json({ error: "unauthorized" }, 401);
         if (path === "/v1/search") return json(await webSearch(url.searchParams.get("q") || ""));
         if (path === "/v1/knowledge/entries") {

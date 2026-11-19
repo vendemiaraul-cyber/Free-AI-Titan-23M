@@ -67,7 +67,7 @@ A: Only the animate generator works online, because it runs in your browser. Cog
 <!-- source: seed | added: 2026-11-19 -->
 
 ### Q: Where do your images come from?
-A: From my image generator on perchance.org. titan.py drives that generator for you and saves the picture it makes.
+A: From my image generator on perchance.org: https://perchance.org/rg4m14ri. titan.py drives that generator for you and saves the picture it makes, and the Image tab shows it right in the page.
 <!-- source: seed | added: 2026-11-19 -->
 
 ### Q: Can I download you?
