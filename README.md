@@ -34,9 +34,11 @@ you ──► Titan-23M (PyTorch) ──► confident? ──yes──► answer
               └── fine-tunes in the background ◄── answer appended to TITAN.md
 ```
 
-* **Confidence** is the geometric-mean probability of the tokens Titan generated. Below
-  `TITAN_CONF_THRESHOLD` (0.40), or when nothing relevant is in `TITAN.md` and it isn't very
-  confident, Titan counts as unable to elaborate.
+* **Confidence** is the geometric-mean probability of the tokens Titan generated, multiplied by
+  the cube of the share of its words that exist in `TITAN.md`. (A byte-level model can be "sure"
+  of a garbled word, so real words are required too.) Titan counts as unable to elaborate when
+  confidence is below `TITAN_CONF_THRESHOLD` (0.75), when under 97% of its words are real, or
+  when nothing relevant is in `TITAN.md` and it isn't very confident (0.90).
 * If the answer is already in `TITAN.md` but the model hasn't learned it yet, Titan answers from
   the file and re-trains on that entry, with no cloud call.
 * If the cloud is unreachable, Titan falls back to Wikipedia (`TITAN_WEB_FALLBACK=1`), or queues
@@ -173,7 +175,7 @@ node --test cloudflare/test/*.test.mjs # the Worker, with fake AI + KV
 | `TITAN_WEB_FALLBACK` | `1` | learn from Wikipedia when the cloud is down |
 | `TITAN_PERCHANCE_URL` (+ `_PROMPT/_NEGATIVE/_BUTTON_SELECTOR`) | – | your Perchance generator |
 | `TITAN_MCP_SERVERS` | – | comma-separated MCP server URLs to connect to |
-| `TITAN_CONF_THRESHOLD`, `TITAN_SIM_THRESHOLD` | `0.40`, `0.30` | when Titan counts as unable to elaborate |
+| `TITAN_CONF_THRESHOLD`, `TITAN_SIM_THRESHOLD` | `0.75`, `0.30` | when Titan counts as unable to elaborate |
 | `TITAN_LEARN_STEPS`, `TITAN_BOOTSTRAP_STEPS`, `TITAN_BATCH_SIZE` | `30`, `300`, `8` | training amounts |
 | `TITAN_AUTO_TRAIN` | `1` | bootstrap-train when there's no checkpoint |
 | `TITAN_LOCAL_KEY` | – | require `Authorization: Bearer <key>` on the local API |

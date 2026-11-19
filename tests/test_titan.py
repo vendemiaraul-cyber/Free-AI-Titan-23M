@@ -55,6 +55,11 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(kb.search("Hello")[0][1].question, "Hello")
         self.assertEqual(kb.search("what is the capital of peru"), [])
 
+    def test_word_validity_flags_garble(self):
+        kb = titan.KnowledgeBase(ROOT / "TITAN.md")
+        self.assertEqual(kb.word_validity("I am Titan, a small free AI."), 1.0)
+        self.assertLess(kb.word_validity("I am Tit I an flera fram questit"), 0.97)
+
     def test_add_and_replace(self):
         kb = titan.KnowledgeBase(self.dir / "TITAN.md")
         e = kb.add("What is 2+2?", "4", "user")

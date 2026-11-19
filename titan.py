@@ -104,8 +104,9 @@ class Config:
     # MCP servers to connect to (client side)
     mcp_servers: list = field(default_factory=list)
     # answering
-    conf_threshold: float = 0.40   # below this geometric-mean token prob -> can't elaborate
-    high_conf: float = 0.85        # confident enough to answer without a knowledge hit
+    conf_threshold: float = 0.75   # below this confidence -> Titan can't elaborate (see Brain.think)
+    high_conf: float = 0.90        # confident enough to answer without a knowledge hit
+    min_word_validity: float = 0.97  # share of draft words that must exist in TITAN.md
     sim_threshold: float = 0.30    # knowledge hit counts as relevant above this
     recall_threshold: float = 0.55 # strong hit: answer from TITAN.md if the model fails
     temperature: float = 0.6
@@ -265,6 +266,15 @@ class KnowledgeBase:
                 df[w] = df.get(w, 0) + 1
         self.idf = {w: math.log(1 + n / c) for w, c in df.items()}
         self.vecs = [(self._vec(d), self._vec(a)) for d, a in zip(docs, ans)]
+        self.vocab = set(WORD_RE.findall(self.text.lower()))
+
+    def word_validity(self, text: str) -> float:
+        """Share of the words in `text` that Titan has ever seen in TITAN.md (garbled words aren't)."""
+        ws = WORD_RE.findall(text.lower())
+        if not ws:
+            return 0.0
+        with self.lock:
+            return sum(w in self.vocab for w in ws) / len(ws)
 
     def _vec(self, toks: list[str]) -> dict:
         v: dict[str, float] = {}
@@ -1170,12 +1180,17 @@ class Brain:
 
     # -- core ----------------------------------------------------------------------
     def think(self, question: str, knowledge: str = "") -> tuple[str, float]:
+        """Generate a draft. Confidence = geometric-mean token probability x word validity^3.
+
+        A byte-level model can be "sure" about most bytes of a garbled word, so token probability
+        alone is too optimistic; requiring the words to be real (seen in TITAN.md) fixes that.
+        """
         prompt = [BOS] + encode(format_prompt(question, knowledge))
         with self.model_lock:
             ids, logps = self.model.generate(prompt, self.cfg.max_new_tokens, self.cfg.temperature, self.cfg.top_k)
         text = decode(ids).strip()
-        conf = math.exp(sum(logps) / len(logps)) if logps else 0.0
-        return text, conf
+        token_conf = math.exp(sum(logps) / len(logps)) if logps else 0.0
+        return text, token_conf * self.kb.word_validity(text) ** 3  # cubed: a few broken words matter
 
     def report(self, rec: dict) -> None:
         rec = {"time": _dt.datetime.now().isoformat(timespec="seconds"), **rec}
@@ -1235,10 +1250,12 @@ class Brain:
             return {**self.learn(question, hits, "", 0.0, "lesson requested"), "confidence": 0.0}
         draft, conf = self.think(question, best.answer if relevant else "")
         too_short = len(draft) < 2
-        if not too_short and conf >= self.cfg.conf_threshold and (relevant or conf >= self.cfg.high_conf):
+        garbled = self.kb.word_validity(draft) < self.cfg.min_word_validity
+        if (not too_short and not garbled and conf >= self.cfg.conf_threshold
+                and (relevant or conf >= self.cfg.high_conf)):
             return {"reply": draft, "source": "titan", "confidence": round(conf, 4), "notices": [],
                     "learned": False, "knowledge": best.id if relevant else None}
-        reason = ("empty answer" if too_short else
+        reason = ("empty answer" if too_short else "garbled words" if garbled else
                   "low confidence" if conf < self.cfg.conf_threshold else "nothing about it in TITAN.md")
         if best is not None and best_score >= self.cfg.recall_threshold:
             # The answer is already in TITAN.md: no cloud call needed, just recall it and train on it.
