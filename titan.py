@@ -3,7 +3,7 @@
 Free-AI-Titan-23M — single-file edition.
 
 Everything in one file:
-  * Titan, a ~23M-parameter byte-level transformer written in PyTorch
+  * Titan, a byte-level transformer written in PyTorch: 23M, 125M, 350M or 1.3B parameters
   * TITAN.md, its Markdown knowledge file (retrieval + training data)
   * Cloud learning: when Titan can't elaborate an answer it calls its teacher,
     gpt-oss-120b on Cloudflare Workers AI, posts an automatic report message,
@@ -17,7 +17,8 @@ Everything in one file:
 
 Quick start:
     pip install torch pillow
-    python titan.py train          # train on TITAN.md
+    python titan.py train          # train on TITAN.md (--size 23m|125m|350m|1.3b, default auto)
+    python titan.py download ltx   # download a video generator (or: all, --deps for its packages)
     python titan.py serve          # API + browser UI on http://127.0.0.1:8023
     python titan.py chat           # terminal chat
     python titan.py mcp            # MCP server over stdio
@@ -84,10 +85,46 @@ class ModelConfig:
     ctx: int = 1536
     dropout: float = 0.0
 
+    @classmethod
+    def preset(cls, size: str) -> "ModelConfig":
+        p = MODEL_PRESETS[size]
+        return cls(n_layer=p["n_layer"], n_head=p["n_head"], d_model=p["d_model"], ctx=p["ctx"])
+
+
+# Model sizes, all trained from scratch on TITAN.md. Names match the real parameter counts.
+# "train_gb" is the memory full training needs (fp32 weights + AdamW state + gradients, before activations).
+MODEL_PRESETS: dict[str, dict] = {
+    "23m":  {"n_layer": 7,  "n_head": 8,  "d_model": 512,  "ctx": 1536, "params": "23.0M",
+             "train_gb": 0.4, "hardware": "any CPU"},
+    "125m": {"n_layer": 15, "n_head": 13, "d_model": 832,  "ctx": 2048, "params": "126.7M",
+             "train_gb": 2.0, "hardware": "a GPU or Apple Silicon (slow on CPU)"},
+    "350m": {"n_layer": 28, "n_head": 16, "d_model": 1024, "ctx": 2048, "params": "355.1M",
+             "train_gb": 5.7, "hardware": "an NVIDIA GPU with 12 GB+"},
+    "1.3b": {"n_layer": 26, "n_head": 16, "d_model": 2048, "ctx": 2048, "params": "1.31B",
+             "train_gb": 21.0, "hardware": "an NVIDIA GPU with 40 GB+"},
+}
+
+
+def resolve_size(size: str) -> str:
+    """'auto' picks the biggest preset this machine can train comfortably."""
+    size = (size or "auto").lower()
+    if size != "auto":
+        if size not in MODEL_PRESETS:
+            raise SystemExit(f"unknown size {size!r}; choose auto or one of {', '.join(MODEL_PRESETS)}")
+        return size
+    if torch.cuda.is_available():
+        vram = torch.cuda.get_device_properties(0).total_memory / 2**30
+        # cards report a bit less than their label (a "40 GB" A100 is ~39.5 GiB)
+        return "1.3b" if vram >= 38 else "350m" if vram >= 11 else "125m"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "125m"
+    return "23m"
+
 
 @dataclass
 class Config:
     home: Path = Path(__file__).resolve().parent
+    size: str = "23m"              # TITAN_SIZE: auto, 23m, 125m, 350m or 1.3b (see MODEL_PRESETS)
     model: ModelConfig = field(default_factory=ModelConfig)
     # cloud teacher: either your deployed worker, or Cloudflare's REST API directly
     cloud_url: str = ""            # TITAN_CLOUD_URL  e.g. https://free-ai-titan-23m.<you>.workers.dev
@@ -129,7 +166,8 @@ class Config:
 
     @property
     def ckpt_path(self) -> Path:
-        return self.home / "titan.pt"
+        # one checkpoint per size, so switching sizes never overwrites another model
+        return self.home / ("titan.pt" if self.size == "23m" else f"titan-{self.size}.pt")
 
     @property
     def reports_path(self) -> Path:
@@ -148,6 +186,8 @@ class Config:
         if e("TITAN_HOME"):
             c.home = Path(e("TITAN_HOME")).expanduser().resolve()
             c.home.mkdir(parents=True, exist_ok=True)
+        c.size = resolve_size(e("TITAN_SIZE", "auto"))
+        c.model = ModelConfig.preset(c.size)
         c.cloud_url = e("TITAN_CLOUD_URL", "").rstrip("/")
         c.cloud_key = e("TITAN_API_KEY", "")
         c.cf_account_id = e("TITAN_CF_ACCOUNT_ID", "")
@@ -456,7 +496,9 @@ class Titan(nn.Module):
         max_new = max(1, min(max_new, ctx // 2))
         prompt = prompt[-(ctx - max_new):]
         caches = [dict() for _ in self.blocks]
-        logits, _ = self(torch.tensor([prompt], device=dev), caches=caches)
+        amp = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda")
+        with amp:
+            logits, _ = self(torch.tensor([prompt], device=dev), caches=caches)
         logits = logits[0, -1].float()
         pos = len(prompt)
         out, logps = [], []
@@ -480,7 +522,8 @@ class Titan(nn.Module):
                 break
             if pos >= ctx:
                 break
-            logits, _ = self(torch.tensor([[tok]], device=dev), caches=caches, pos_offset=pos)
+            with amp:
+                logits, _ = self(torch.tensor([[tok]], device=dev), caches=caches, pos_offset=pos)
             logits = logits[0, -1].float()
             pos += 1
         return out, logps
@@ -529,7 +572,8 @@ def train_steps(model: Titan, entries: list[Entry], steps: int, lr: float, batch
         warm = min(1.0, (step + 1) / 10)
         for g in opt.param_groups:
             g["lr"] = lr * warm
-        _, loss = model(X, Y)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+            _, loss = model(X, Y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -577,12 +621,17 @@ class BackgroundTrainer:
                     steps, lr = job["steps"] or b.cfg.bootstrap_steps, b.cfg.lr
                 else:
                     steps, lr = job["steps"] or b.cfg.learn_steps, b.cfg.learn_lr
-                with b.model_lock:
-                    work = copy.deepcopy(b.model)
-                losses = train_steps(work, entries, steps, lr, b.cfg.batch_size, focus=focus)
-                with b.model_lock:
-                    b.model.load_state_dict(work.state_dict())
-                    b.trained_steps += steps
+                if b.model.num_params() <= 400_000_000:
+                    with b.model_lock:
+                        work = copy.deepcopy(b.model)
+                    losses = train_steps(work, entries, steps, lr, b.cfg.batch_size, focus=focus)
+                    with b.model_lock:
+                        b.model.load_state_dict(work.state_dict())
+                        b.trained_steps += steps
+                else:  # too big to copy: train the live model (chat waits until this job ends)
+                    with b.model_lock:
+                        losses = train_steps(b.model, entries, steps, lr, b.cfg.batch_size, focus=focus)
+                        b.trained_steps += steps
                 b.save()
                 rec = {"kind": job["kind"], "questions": job["questions"], "steps": steps,
                        "loss": round(sum(losses[-5:]) / max(1, len(losses[-5:])), 4),
@@ -644,7 +693,7 @@ class TeacherUnavailable(Exception):
 
 
 TEACHER_SYSTEM = (
-    "You are the teacher of Titan-23M, a tiny 23M-parameter AI that learns from your answers. "
+    "You are the teacher of Titan-23M, a small AI (23M to 1.3B parameters) that learns from your answers. "
     "Titan could not answer the user's question by itself. Write the answer Titan should learn: "
     "correct, self-contained, friendly, plain text (no Markdown headings, no tables), at most 80 words. "
     "If the question needs real-time information you don't have, say so briefly."
@@ -855,16 +904,18 @@ VIDEO_BACKENDS: dict[str, dict] = {
     "animate": {"kind": "image-to-video", "online": True, "gpu": False,
                 "description": "Ken Burns zoom/pan over an image (your Perchance image or an upload). "
                                "Runs anywhere, also in the browser edition."},
-    "cogvideox": {"kind": "text-to-video", "online": False, "gpu": True, "model": "THUDM/CogVideoX-2b",
+    "cogvideox": {"download_gb": 13.8, "kind": "text-to-video", "online": False, "gpu": True, "model": "THUDM/CogVideoX-2b",
                   "pipeline": "CogVideoXPipeline", "description": "CogVideoX-2B, 6 s clips, ~12 GB VRAM with offload."},
-    "ltx": {"kind": "text-to-video", "online": False, "gpu": True, "model": "Lightricks/LTX-Video",
+    "ltx": {"download_gb": 28.4, "kind": "text-to-video", "online": False, "gpu": True, "model": "Lightricks/LTX-Video",
             "pipeline": "LTXPipeline", "description": "LTX-Video, fast text-to-video."},
-    "wan": {"kind": "text-to-video", "online": False, "gpu": True, "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "wan": {"download_gb": 28.9, "kind": "text-to-video", "online": False, "gpu": True, "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             "pipeline": "WanPipeline", "description": "Wan 2.1 1.3B, ~8 GB VRAM."},
-    "modelscope": {"kind": "text-to-video", "online": False, "gpu": True, "model": "ali-vilab/text-to-video-ms-1.7b",
-                   "pipeline": "DiffusionPipeline", "description": "ModelScope 1.7B, small and old but light."},
-    "svd": {"kind": "image-to-video", "online": False, "gpu": True,
+    "modelscope": {"download_gb": 3.7, "kind": "text-to-video", "online": False, "gpu": True, "model": "ali-vilab/text-to-video-ms-1.7b",
+                   "pipeline": "DiffusionPipeline", "variant": "fp16", "description": "ModelScope 1.7B, small and old but light."},
+    "svd": {"download_gb": 4.5, "kind": "image-to-video", "online": False, "gpu": True,
             "model": "stabilityai/stable-video-diffusion-img2vid-xt", "pipeline": "StableVideoDiffusionPipeline",
+            "variant": "fp16",
+            "gated": True,
             "description": "Stable Video Diffusion XT: animates an image (accept its license on Hugging Face first)."},
 }
 
@@ -877,21 +928,154 @@ def _has(mod: str) -> bool:
         return False
 
 
+# What the heavy video generators need (pip names). `python titan.py download --deps` installs them.
+VIDEO_PIP = ["diffusers", "transformers", "accelerate", "sentencepiece", "ftfy", "imageio", "imageio-ffmpeg",
+             "huggingface_hub"]
+
+
+def select_video_files(files: list[tuple[str, int]], components: set[str], variant: Optional[str]) -> list[tuple[str, int]]:
+    """Pick exactly the files diffusers loads: model_index.json + the pipeline's component folders, one weight
+    format per folder (safetensors over .bin; the fp16 variant only when the pipeline loads it). This skips the
+    extra single-file checkpoints, example images and duplicate formats many repos also contain."""
+    by_dir: dict[str, list[tuple[str, int]]] = {}
+    out = [f for f in files if f[0] == "model_index.json"]
+    for path, size in files:
+        top = path.split("/", 1)[0]
+        if "/" in path and top in components:
+            by_dir.setdefault(top, []).append((path, size))
+    for top, items in by_dir.items():
+        weights = [f for f in items if f[0].endswith((".safetensors", ".bin"))]
+        others = [f for f in items if f not in weights]
+        if any(f[0].endswith(".safetensors") for f in weights):
+            weights = [f for f in weights if f[0].endswith(".safetensors")]
+        tagged = [f for f in weights if variant and f".{variant}." in f[0]]
+        weights = tagged or [f for f in weights if ".fp16." not in f[0]]
+        out += others + weights
+    return out
+
+
+class VideoDownloader:
+    """Downloads video generator weights from Hugging Face into the normal HF cache, with progress."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.jobs: dict[str, dict] = {}
+        self._sizes: dict[str, list] = {}
+        self.lock = threading.Lock()
+
+    @property
+    def marker(self) -> Path:
+        return self.cfg.home / "titan_downloads.json"
+
+    def _completed(self) -> dict:
+        try:
+            return json.loads(self.marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    # the Hugging Face calls (replaced in tests)
+    def _list_files(self, repo: str) -> list[tuple[str, int]]:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(repo, files_metadata=True)
+        return [(f.rfilename, int(f.size or 0)) for f in info.siblings]
+
+    def _components(self, repo: str) -> set[str]:
+        from huggingface_hub import hf_hub_download
+        index = json.loads(Path(hf_hub_download(repo, "model_index.json")).read_text(encoding="utf-8"))
+        return {k for k, v in index.items() if isinstance(v, list) and v and v[0]}
+
+    def _fetch(self, repo: str, path: str) -> None:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo, path)
+
+    def files(self, name: str) -> list[tuple[str, int]]:
+        if name not in self._sizes:
+            spec = VIDEO_BACKENDS[name]
+            self._sizes[name] = select_video_files(self._list_files(spec["model"]), self._components(spec["model"]),
+                                                   spec.get("variant"))
+        return self._sizes[name]
+
+    def status(self, name: str) -> dict:
+        spec = VIDEO_BACKENDS[name]
+        if "model" not in spec:
+            return {"state": "built-in", "note": "nothing to download"}
+        with self.lock:
+            job = dict(self.jobs.get(name) or {})
+        if job:
+            return job
+        done = self._completed().get(name)
+        if done:
+            return {"state": "downloaded", "bytes_total": done.get("bytes", 0), "finished": done.get("finished")}
+        return {"state": "not downloaded", "bytes_total": None}
+
+    def start(self, name: str) -> dict:
+        if name not in VIDEO_BACKENDS or "model" not in VIDEO_BACKENDS[name]:
+            raise ValueError(f"{name!r} has nothing to download; choose from "
+                             + ", ".join(n for n, s in VIDEO_BACKENDS.items() if "model" in s))
+        with self.lock:
+            if (self.jobs.get(name) or {}).get("state") == "downloading":
+                return dict(self.jobs[name])
+            self.jobs[name] = {"state": "downloading", "bytes_done": 0, "bytes_total": None,
+                               "files_done": 0, "files_total": None, "current": None}
+        threading.Thread(target=self._run_safe, args=(name,), daemon=True, name=f"download-{name}").start()
+        return self.status(name)
+
+    def _run_safe(self, name: str) -> None:
+        try:
+            self.download(name)
+        except Exception as ex:
+            msg = str(ex)
+            if "401" in msg or "403" in msg or "gated" in msg.lower():
+                msg += " (this model is gated: accept its license on huggingface.co and set HF_TOKEN)"
+            with self.lock:
+                self.jobs[name] = {**self.jobs.get(name, {}), "state": "error", "error": msg}
+            log(f"download of {name} failed: {msg}")
+
+    def download(self, name: str, on_file: Optional[Callable[[str, int, int, int], None]] = None) -> dict:
+        """Blocking download (used by the CLI and the background thread)."""
+        repo = VIDEO_BACKENDS[name]["model"]
+        files = self.files(name)
+        total = sum(sz for _, sz in files)
+        done_bytes = 0
+        with self.lock:
+            self.jobs[name] = {"state": "downloading", "bytes_done": 0, "bytes_total": total,
+                               "files_done": 0, "files_total": len(files), "current": None}
+        for i, (path, size) in enumerate(files):
+            with self.lock:
+                self.jobs[name]["current"] = path
+            self._fetch(repo, path)
+            done_bytes += size
+            with self.lock:
+                self.jobs[name].update(bytes_done=done_bytes, files_done=i + 1)
+            if on_file:
+                on_file(path, i + 1, len(files), done_bytes)
+        completed = self._completed()
+        completed[name] = {"repo": repo, "bytes": total, "finished": _dt.datetime.now().isoformat(timespec="seconds")}
+        self.marker.write_text(json.dumps(completed, indent=1), encoding="utf-8")
+        with self.lock:
+            self.jobs.pop(name, None)
+        log(f"downloaded {name} ({repo}, {total / 1e9:.1f} GB)")
+        return self.status(name)
+
+
 class VideoGenerator:
     def __init__(self, cfg: Config, images: PerchanceImageGenerator):
         self.cfg, self.images = cfg, images
         self._pipes: dict[str, Any] = {}
         self.lock = threading.Lock()
+        self.downloads = VideoDownloader(cfg)
 
     def backends(self) -> list[dict]:
         cuda = torch.cuda.is_available()
         out = []
         for name, spec in VIDEO_BACKENDS.items():
-            deps = ["PIL"] if name == "animate" else ["diffusers", "transformers", "PIL"]
+            deps = ["PIL"] if name == "animate" else ["diffusers", "transformers", "huggingface_hub", "PIL"]
             missing = [d for d in deps if not _has(d)]
             out.append({"name": name, **{k: v for k, v in spec.items() if k != "pipeline"},
                         "available": not missing, "missing": missing,
                         "where": "device + browser" if spec["online"] else "device only",
+                        "download": self.downloads.status(name),
+                        "pip": None if not missing else "pip install " + " ".join(VIDEO_PIP),
                         "warning": None if (not spec["gpu"] or cuda) else "no CUDA GPU found: will be very slow on CPU"})
         return out
 
@@ -937,8 +1121,8 @@ class VideoGenerator:
             if name == "wan":
                 kw["vae"] = diffusers.AutoencoderKLWan.from_pretrained(spec["model"], subfolder="vae",
                                                                        torch_dtype=torch.float32)
-            if name == "svd" and cuda:
-                kw["variant"] = "fp16"
+            if spec.get("variant"):
+                kw["variant"] = spec["variant"]  # the same files `titan.py download` fetches
             pipe = getattr(diffusers, spec["pipeline"]).from_pretrained(spec["model"], **kw)
             if cuda:
                 try:
@@ -1165,6 +1349,7 @@ class Brain:
         ck = torch.load(self.cfg.ckpt_path, map_location="cpu", weights_only=True)
         mc = ModelConfig(**ck["config"])
         if mc != self.cfg.model:
+            log(f"{self.cfg.ckpt_path.name} was trained with a different shape; using the checkpoint's")
             self.cfg.model = mc
             self.model = Titan(mc).to(self.device)
         self.model.load_state_dict(ck["state_dict"])
@@ -1173,7 +1358,8 @@ class Brain:
 
     def info(self) -> dict:
         return {"name": NAME, "version": __version__, "edition": "single-file (titan.py)",
-                "parameters": self.model.num_params(), "config": asdict(self.cfg.model),
+                "size": self.cfg.size, "parameters": self.model.num_params(), "config": asdict(self.cfg.model),
+                "checkpoint": self.cfg.ckpt_path.name,
                 "device": str(self.device), "trained_steps": self.trained_steps,
                 "knowledge_entries": len(self.kb.entries), "teacher": {"model": self.cfg.teacher_model,
                                                                         "mode": self.teacher.mode},
@@ -1356,6 +1542,9 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "backend": {"type": "string", "enum": list(VIDEO_BACKENDS)},
          "frames": {"type": "integer"}, "image_base64": {"type": "string"}}, "required": ["prompt"]}},
+    {"name": "titan_download_video_generator", "description": "Download a video generator's weights to this device "
+                                                              "(cogvideox, ltx, wan, modelscope or svd).",
+     "inputSchema": {"type": "object", "properties": {"backend": {"type": "string"}}, "required": ["backend"]}},
     {"name": "titan_web_search", "description": "Search the web (DuckDuckGo instant answers + Wikipedia).",
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "titan_teach", "description": "Teach Titan a question/answer pair (saved to TITAN.md, then trained).",
@@ -1385,6 +1574,8 @@ def mcp_call_tool(brain: Brain, name: str, a: dict) -> dict:
         img = base64.b64decode(a["image_base64"]) if a.get("image_base64") else None
         r = brain.videos.generate(a["prompt"], a.get("backend", "animate"), img, a.get("frames"))
         return text(json.dumps(r))
+    if name == "titan_download_video_generator":
+        return text(json.dumps(brain.videos.downloads.start(a["backend"])))
     if name == "titan_web_search":
         return text(json.dumps(web_search(a["query"]), ensure_ascii=False, indent=1))
     if name == "titan_teach":
@@ -1457,7 +1648,7 @@ UI_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Titan-23M</title>
-<meta name="description" content="Titan-23M: a free 23M-parameter PyTorch AI that learns what it doesn't know. Downloadable, or talk to it in the browser.">
+<meta name="description" content="Titan-23M: a free PyTorch AI (23M to 1.3B parameters) that learns what it doesn't know. Downloadable, or talk to it in the browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1506,6 +1697,15 @@ label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4
 .hint{font-size:13px;color:var(--muted)}.err{color:var(--err)}
 pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;flex:1;margin:0;font-size:13px}
 iframe{width:100%;background:#fff}
+.dl-list{display:flex;flex-direction:column;gap:10px}
+.dl-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+.dl-row:first-child{border-top:0}
+.dl-name{font-weight:600}.dl-meta{font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+.dl-bar{grid-column:1/-1;height:6px;border-radius:99px;background:var(--line);overflow:hidden}
+.dl-bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .4s}
+.dl-row code{font-size:12px;overflow-wrap:anywhere}
+button.ghost{background:none;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:7px 12px;font:inherit;font-size:14px;cursor:pointer}
+button.ghost:disabled{opacity:.55;cursor:default}
 a{color:var(--accent)}
 
 /* ---------- landing page ---------- */
@@ -1609,7 +1809,7 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
 <header class="hero">
   <span class="eyebrow"><span class="dot"></span><span><b>Free &amp; open source</b> · PyTorch · <span id="hEdition">online</span></span></span>
   <h1>Titan-23M</h1>
-  <p class="lead">A free AI with 23 million parameters that learns what it doesn't know. It keeps its memory in <b>TITAN.md</b>, and when it can't answer, its teacher <b>gpt-oss-120b</b> on Cloudflare teaches it.</p>
+  <p class="lead">A free AI, from 23 million up to 1.3 billion parameters, that learns what it doesn't know. It keeps its memory in <b>TITAN.md</b>, and when it can't answer, its teacher <b>gpt-oss-120b</b> on Cloudflare teaches it.</p>
   <p class="quote">Download it as one file or talk to it right here in the browser. You can connect it to an MCP server, or ask it to use a connector like web search.</p>
   <form class="askbox" id="heroForm"><input id="heroIn" autocomplete="off" placeholder="Ask Titan anything…" aria-label="Ask Titan"><button class="btn btn-primary">Ask</button></form>
   <div class="chips" id="chips">
@@ -1626,8 +1826,8 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
 <div class="stats">
   <div class="stat"><b id="sParams">23.0M</b><span>parameters</span></div>
   <div class="stat"><b id="sFacts">—</b><span>facts in TITAN.md</span></div>
-  <div class="stat"><b>7 × 512</b><span>layers × width</span></div>
-  <div class="stat"><b>1,536</b><span>bytes of context</span></div>
+  <div class="stat"><b id="sShape">7 × 512</b><span>layers × width</span></div>
+  <div class="stat"><b id="sCtx">1,536</b><span>bytes of context</span></div>
   <div class="stat"><b id="sTeacher">gpt-oss-120b</b><span>cloud teacher</span></div>
 </div>
 
@@ -1661,7 +1861,7 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
   <p class="sub">Titan checks its own answer. It needs a high token probability, and the words must be real words from TITAN.md, not garble.</p>
   <div class="steps">
     <div class="step"><h3>Recall</h3><p>Finds the closest entry in TITAN.md and reads it as context.</p></div>
-    <div class="step"><h3>Answer</h3><p>The 23M-parameter transformer writes a draft byte by byte.</p></div>
+    <div class="step"><h3>Answer</h3><p>Titan's transformer (23M to 1.3B parameters) writes a draft byte by byte.</p></div>
     <div class="step"><h3>Check</h3><p>Low confidence, garbled words, or nothing in TITAN.md means it can't elaborate.</p></div>
     <div class="step"><h3>Cloud call</h3><p>gpt-oss-120b answers, and an automatic message reports it.</p></div>
     <div class="step"><h3>Train</h3><p>The lesson is added to TITAN.md and Titan fine-tunes on it in the background.</p></div>
@@ -1675,8 +1875,8 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
   <p class="sub">Both editions share the same memory format, API and this interface.</p>
   <div class="editions">
     <div class="ed"><h3>Single file</h3><p class="tag">titan.py · runs on your device</p>
-      <ul><li>The PyTorch Titan-23M model, trained on TITAN.md</li><li>Learns in the background while you chat</li>
-      <li>Drives the Perchance generator and saves your images</li><li>Runs every video generator locally</li>
+      <ul><li>The PyTorch model in four sizes, 23M to 1.3B, trained on TITAN.md</li><li>Learns in the background while you chat</li>
+      <li>Drives the Perchance generator and saves your images</li><li>Downloads and runs every video generator locally</li>
       <li>REST API, OpenAI-compatible chat, and MCP over stdio or HTTP</li></ul></div>
     <div class="ed"><h3>In the browser</h3><p class="tag">Cloudflare edition · nothing to install</p>
       <ul><li>Chat straight from this page</li><li>TITAN.md stored in the cloud and shared with titan.py</li>
@@ -1786,6 +1986,10 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
     <div class="hint" id="vidHint"></div>
   </div>
   <div class="out" id="vidOut"></div>
+  <div class="card">
+    <div><b>Download video generators</b> <span class="hint">· they run on your device, so their weights are saved there</span></div>
+    <div id="dlList" class="dl-list"><span class="hint">loading…</span></div>
+  </div>
 </section>
 
 <section id="knowledge">
@@ -1843,7 +2047,8 @@ let EDITION="";
 api("/v1/health").then(h=>{
   EDITION=h.edition||""; $("#edition").textContent=EDITION;
   $("#hEdition").textContent=EDITION==="Cloudflare"?"in your browser":"on your device";
-  if(h.parameters) $("#sParams").textContent=(h.parameters/1e6).toFixed(1)+"M";
+  if(h.parameters) $("#sParams").textContent = h.parameters>=1e9 ? (h.parameters/1e9).toFixed(2)+"B" : (h.parameters/1e6).toFixed(1)+"M";
+  if(h.config){ $("#sShape").textContent=h.config.n_layer+" × "+h.config.d_model; $("#sCtx").textContent=h.config.ctx.toLocaleString("en-US"); }
   if(h.knowledge_entries!=null) $("#sFacts").textContent=h.knowledge_entries;
   if(h.teacher) $("#sTeacher").textContent=h.teacher;
   $("#status").textContent=[h.parameters?(h.parameters/1e6).toFixed(1)+"M params":"", h.knowledge_entries+" facts",
@@ -1893,8 +2098,41 @@ api("/v1/video/backends").then(r=>{
   BACKENDS=r.backends||[];
   $("#vidBackend").innerHTML=`<option value="browser">animate — in this browser (works online)</option>`+
     BACKENDS.map(b=>`<option value="${esc(b.name)}" ${b.available?"":"disabled"}>${esc(b.name)} — ${esc(b.where)}${b.available?"":" (not installed)"}</option>`).join("");
-  showVidHint();
-}).catch(()=>{$("#vidBackend").innerHTML=`<option value="browser">animate — in this browser (works online)</option>`; showVidHint();});
+  showVidHint(); renderDownloads();
+}).catch(()=>{$("#vidBackend").innerHTML=`<option value="browser">animate — in this browser (works online)</option>`; showVidHint(); renderDownloads();});
+
+// downloads of the on-device video generators
+const gb = n => n==null ? "" : (n/1e9).toFixed(1)+" GB";
+let dlTimer=null;
+function renderDownloads(){
+  const heavy = BACKENDS.filter(b=>b.model);
+  if(!heavy.length || !heavy.some(b=>b.download)){   // the Cloudflare edition can't run these
+    $("#dlList").innerHTML=`<span class="hint">These generators run on your own device. Get <a href="https://github.com/vendemiaraul-cyber/Free-AI-Titan-23M" target="_blank" rel="noopener">titan.py</a>, then run <code>python titan.py download</code> or open this tab in <code>python titan.py serve</code>.</span>`;
+    return;
+  }
+  const needPip = heavy.find(b=>b.missing && b.missing.length);
+  const head = needPip ? `<div class="hint">First install the packages they need: <code>python titan.py download --deps</code> (or <code>${esc(needPip.pip||"")}</code>), then restart <code>titan.py serve</code>.</div>` : "";
+  $("#dlList").innerHTML = head + heavy.map(b=>{
+    const d=b.download||{}, st=d.state||"not downloaded";
+    const pct = d.bytes_total ? Math.round(100*(d.bytes_done||0)/d.bytes_total) : 0;
+    let meta = `${esc(b.kind)} · ${esc(b.model)}${b.download_gb?` · ~${b.download_gb} GB`:""}${b.gated?" · needs HF_TOKEN (gated)":""}`, btn = "";
+    if(b.missing && b.missing.length){ btn=`<button class="ghost" disabled>Download</button>`; }
+    else if(st==="downloading"){ meta += `<br>Downloading… ${pct}% · ${gb(d.bytes_done)} of ${gb(d.bytes_total)||"?"} · file ${d.files_done||0}/${d.files_total||"?"}`; btn=`<button class="ghost" disabled>${pct}%</button>`; }
+    else if(st==="downloaded"){ meta += `<br>✓ Downloaded (${gb(d.bytes_total)}). Pick it in the generator list above.`; btn=`<button class="ghost" disabled>Ready</button>`; }
+    else if(st==="error"){ meta += `<br><span class="err">${esc(d.error||"failed")}</span>`; btn=`<button class="ghost" data-dl="${esc(b.name)}">Retry</button>`; }
+    else { btn=`<button class="ghost" data-dl="${esc(b.name)}">Download</button>`; }
+    const bar = st==="downloading" ? `<div class="dl-bar"><i style="width:${pct}%"></i></div>` : "";
+    return `<div class="dl-row"><div><span class="dl-name">${esc(b.name)}</span> <span class="dl-meta">${meta}</span></div>${btn}${bar}</div>`;
+  }).join("");
+  document.querySelectorAll("[data-dl]").forEach(x=>x.onclick=async()=>{
+    x.disabled=true; x.textContent="Starting…";
+    try{ await api("/v1/video/download",{backend:x.dataset.dl}); }catch(e){ x.textContent="Error"; alert(e.message); }
+    refreshDownloads();
+  });
+  clearTimeout(dlTimer);
+  if(heavy.some(b=>(b.download||{}).state==="downloading")) dlTimer=setTimeout(refreshDownloads,2000);
+}
+async function refreshDownloads(){ try{ const r=await api("/v1/video/backends"); BACKENDS=r.backends||[]; }catch(e){} renderDownloads(); }
 $("#vidBackend").onchange=showVidHint;
 function showVidHint(){const v=$("#vidBackend").value; const b=BACKENDS.find(x=>x.name===v);
   $("#vidHint").textContent = v==="browser" ? "Runs right here: animates your image (or a title card) into a WebM clip." : (b? b.description+(b.warning?" ⚠ "+b.warning:"") : "");}
@@ -2004,7 +2242,8 @@ class TitanHTTP(BaseHTTPRequestHandler):
                 return self._send(200, f.read_bytes(), mimetypes.guess_type(f.name)[0] or "application/octet-stream")
             if p == "/v1/health":
                 return self._json({"ok": True, "name": NAME, "version": __version__, "edition": "titan.py",
-                                   "parameters": b.model.num_params(), "knowledge_entries": len(b.kb.entries),
+                                   "size": b.cfg.size, "parameters": b.model.num_params(),
+                                   "config": asdict(b.cfg.model), "knowledge_entries": len(b.kb.entries),
                                    "teacher": b.cfg.teacher_model.split("/")[-1], "teacher_mode": b.teacher.mode,
                                    "training": b.trainer.status()})
             if not self._authorized():
@@ -2021,6 +2260,8 @@ class TitanHTTP(BaseHTTPRequestHandler):
                 return self._json(web_search((qs.get("q") or [""])[0]))
             if p == "/v1/video/backends":
                 return self._json({"backends": b.videos.backends()})
+            if p == "/v1/video/download":
+                return self._json({"downloads": {n: b.videos.downloads.status(n) for n in VIDEO_BACKENDS}})
             if p == "/v1/image/status":
                 return self._json(b.images.status())
             if p == "/v1/reports":
@@ -2083,6 +2324,9 @@ class TitanHTTP(BaseHTTPRequestHandler):
                                       body.get("seed"), str(body.get("negative_prompt", "")))
                 r["video_url"] = self._file_url(r["file"])
                 return self._json(r)
+            if p == "/v1/video/download":  # start downloading a video generator's weights
+                name = str(body.get("backend", ""))
+                return self._json({"backend": name, "download": b.videos.downloads.start(name)})
             if p == "/v1/train":
                 ok = b.trainer.submit("bootstrap", steps=int(body.get("steps") or b.cfg.bootstrap_steps))
                 return self._json({"ok": ok, "training": b.trainer.status()})
@@ -2133,9 +2377,52 @@ def cmd_sync(brain: Brain) -> None:
         print(res["notices"][0] if res.get("notices") else res)
 
 
+def cmd_download(names: list[str], deps: bool) -> None:
+    """Download video generator weights (and optionally their pip packages) with progress."""
+    import subprocess
+    downloadable = [n for n, sp in VIDEO_BACKENDS.items() if "model" in sp]
+    if deps:
+        print("installing:", " ".join(VIDEO_PIP))
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *VIDEO_PIP])
+    if not _has("huggingface_hub"):
+        raise SystemExit("huggingface_hub is missing: run  python titan.py download --deps  (or pip install "
+                         + " ".join(VIDEO_PIP) + ")")
+    cfg = Config.from_env()
+    dl = VideoDownloader(cfg)
+    if not names:
+        print("Video generators you can download (python titan.py download <name>|all):")
+        for n in downloadable:
+            sp, st = VIDEO_BACKENDS[n], dl.status(n)
+            try:
+                size = f"{sum(sz for _, sz in dl.files(n)) / 1e9:.1f} GB"
+            except Exception as ex:  # offline etc.
+                size = f"size unknown ({type(ex).__name__})"
+            print(f"  {n:11} {sp['kind']:15} {sp['model']:48} {size:>9}  {st['state']}")
+        return
+    if names == ["all"]:
+        names = downloadable
+    for n in names:
+        if n not in downloadable:
+            raise SystemExit(f"unknown video generator {n!r}; choose from {', '.join(downloadable)} or all")
+        files = dl.files(n)
+        total = sum(sz for _, sz in files)
+        print(f"downloading {n} ({VIDEO_BACKENDS[n]['model']}): {len(files)} files, {total / 1e9:.1f} GB")
+        t0 = time.time()
+
+        def on_file(path, i, count, done):
+            pct = 100 * done / total if total else 100
+            print(f"  [{i}/{count}] {pct:5.1f}%  {path}  ({time.time() - t0:.0f}s)", flush=True)
+        dl.download(n, on_file)
+        print(f"  ✓ {n} is ready: python titan.py video \"your prompt\" --backend {n}")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(prog="titan.py", description=f"{NAME}: single-file AI (PyTorch).")
     sub = ap.add_subparsers(dest="cmd")
+    sized = argparse.ArgumentParser(add_help=False)
+    sized.add_argument("--size", help="model size: auto, " + ", ".join(MODEL_PRESETS) + " (default: $TITAN_SIZE or auto)")
+    _add = sub.add_parser
+    sub.add_parser = lambda *a, **k: _add(*a, parents=[sized], **k)  # every command accepts --size
     s = sub.add_parser("serve", help="HTTP API + browser UI")
     s.add_argument("--host", default=os.environ.get("TITAN_HOST", "127.0.0.1"))
     s.add_argument("--port", type=int, default=int(os.environ.get("TITAN_PORT", "8023")))
@@ -2155,8 +2442,27 @@ def main(argv: Optional[list[str]] = None) -> None:
     v.add_argument("--frames", type=int)
     sub.add_parser("sync", help="sync TITAN.md with the cloud and learn queued questions")
     sub.add_parser("info", help="model size and status")
+    sub.add_parser("sizes", help="list the model sizes and what hardware they need")
+    d = sub.add_parser("download", help="download video generators to this device")
+    d.add_argument("backends", nargs="*", help="cogvideox, ltx, wan, modelscope, svd, or all (default: list them)")
+    d.add_argument("--deps", action="store_true", help="also pip install the packages video generators need")
     args = ap.parse_args(argv)
     cmd = args.cmd or "chat"
+
+    if getattr(args, "size", None):
+        os.environ["TITAN_SIZE"] = args.size
+    if cmd == "sizes":
+        chosen = resolve_size(os.environ.get("TITAN_SIZE", "auto"))
+        print(f"{'size':6} {'params':>8} {'layers':>6} {'width':>6} {'context':>7} {'training memory':>16}  needs")
+        for k, p in MODEL_PRESETS.items():
+            mark = "  <- selected" if k == chosen else ""
+            print(f"{k:6} {p['params']:>8} {p['n_layer']:>6} {p['d_model']:>6} {p['ctx']:>7} "
+                  f"{'~' + str(p['train_gb']) + ' GB':>16}  {p['hardware']}{mark}")
+        print("\nPick one with --size or TITAN_SIZE (default: auto = the biggest this machine can train).")
+        return
+    if cmd == "download":
+        cmd_download(args.backends, args.deps)
+        return
 
     cfg = Config.from_env()
     if cmd in ("train", "info", "image", "video", "mcp", "ask", "sync"):
@@ -2181,7 +2487,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"saved {cfg.ckpt_path}")
     elif cmd == "serve":
         srv = make_server(brain, args.host, args.port)
-        print(f"Titan-23M is listening on http://{args.host}:{args.port}  (UI at /, API at /v1, MCP at /mcp)")
+        print(f"Titan ({cfg.size}, {brain.model.num_params()/1e6:.1f}M params) is listening on "
+              f"http://{args.host}:{args.port}  (UI at /, API at /v1, MCP at /mcp)")
         try:
             srv.serve_forever()
         except KeyboardInterrupt:

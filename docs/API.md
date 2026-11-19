@@ -20,6 +20,7 @@ header is required on everything except `/`, `/v1/health`, `GET /v1/knowledge`,
 | `GET/POST /v1/knowledge`, `GET /v1/knowledge/entries` | ✅ | ✅ |
 | `POST /v1/image`, `GET /v1/image/status` | ✅ headless Perchance | ✅ returns your Perchance link |
 | `POST /v1/video`, `GET /v1/video/backends` | ✅ | 501 (use browser `animate`) |
+| `GET/POST /v1/video/download` | ✅ | – |
 | `GET /v1/search?q=` | ✅ | ✅ |
 | `GET /v1/reports` | ✅ | ✅ |
 | `POST /v1/train` | ✅ | – |
@@ -95,7 +96,8 @@ confidence, status (`learned` / `pending`), teacher, entry.
 
 ### `POST /v1/train` (titan.py)
 
-`{ "steps": 300 }` queues a full training run on TITAN.md in the background.
+`{ "steps": 300 }` queues a full training run on TITAN.md in the background. `GET /v1/health` and `GET /v1/model`
+report the running `size` (`23m`, `125m`, `350m` or `1.3b`), its `parameters` and `config`.
 
 ## Images (Perchance)
 
@@ -120,6 +122,17 @@ The browser UI embeds that generator in the Image tab and copies the prompt to y
 
 Lists `animate`, `cogvideox`, `ltx`, `wan`, `modelscope` and `svd`, each with `kind`, `online`,
 `available`, `missing` (packages), `where` and `warning` (e.g. no GPU).
+
+Each heavy backend also has `download`, the state of its weights on this device: `not downloaded`,
+`downloading` (with `bytes_done`, `bytes_total`, `files_done`, `files_total`, `current`), `downloaded`
+or `error` (with `error`). When its packages are missing, `pip` holds the command that installs them.
+
+### `POST /v1/video/download` (titan.py)
+
+`{ "backend": "ltx" }` starts downloading that generator's weights in the background and returns its
+`download` state. Poll `GET /v1/video/download` (all backends) or `GET /v1/video/backends` for
+progress. Only the files the diffusers pipeline loads are downloaded. Gated models (SVD) need
+`HF_TOKEN` in the environment.
 
 ### `POST /v1/video`
 
@@ -148,6 +161,7 @@ responses. `python titan.py mcp` is the same server over stdio.
 | `titan_chat` `{message}` | ✅ | ✅ |
 | `titan_generate_image` `{prompt, negative_prompt?}` | ✅ returns the image | ✅ returns the link |
 | `titan_generate_video` `{prompt, backend?, frames?, image_base64?}` | ✅ | – |
+| `titan_download_video_generator` `{backend}` | ✅ | – |
 | `titan_web_search` `{query}` | ✅ | ✅ |
 | `titan_teach` | `{question, answer}` | `{question}` → gpt-oss-120b |
 | `titan_knowledge` `{query?}` | ✅ | ✅ |

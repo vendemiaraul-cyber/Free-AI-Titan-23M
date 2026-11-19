@@ -58,7 +58,7 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_word_validity_flags_garble(self):
         kb = titan.KnowledgeBase(ROOT / "TITAN.md")
-        self.assertEqual(kb.word_validity("I am Titan, a small free AI."), 1.0)
+        self.assertEqual(kb.word_validity("I am Titan, a free AI."), 1.0)
         self.assertLess(kb.word_validity("I am Tit I an flera fram questit"), 0.97)
 
     def test_add_and_replace(self):
@@ -174,6 +174,113 @@ class BrainTests(unittest.TestCase):
         r = titan.mcp_handle(self.b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                       "params": {"name": "titan_knowledge", "arguments": {"query": "teacher"}}})
         self.assertIn("gpt-oss-120b", r["result"]["content"][0]["text"])
+
+
+class SizeTests(unittest.TestCase):
+    def test_presets_match_their_names(self):
+        import torch
+        expect = {"23m": (22.5e6, 23.5e6), "125m": (120e6, 130e6), "350m": (340e6, 360e6), "1.3b": (1.25e9, 1.35e9)}
+        for name, (lo, hi) in expect.items():
+            with torch.device("meta"):
+                n = titan.Titan(titan.ModelConfig.preset(name)).num_params()
+            self.assertTrue(lo < n < hi, (name, n))
+
+    def test_resolve_and_checkpoint_names(self):
+        self.assertEqual(titan.resolve_size("350m"), "350m")
+        self.assertIn(titan.resolve_size("auto"), titan.MODEL_PRESETS)
+        with self.assertRaises(SystemExit):
+            titan.resolve_size("50b")
+        self.assertEqual(titan.Config(home=Path("/x"), size="23m").ckpt_path.name, "titan.pt")
+        self.assertEqual(titan.Config(home=Path("/x"), size="1.3b").ckpt_path.name, "titan-1.3b.pt")
+
+
+# Real file listing of ali-vilab/text-to-video-ms-1.7b on the Hugging Face Hub (sizes in bytes).
+MODELSCOPE_FILES = [
+    ("model_index.json", 384), ("README.md", 6862), ("scheduler/scheduler_config.json", 465),
+    ("text_encoder/config.json", 644), ("text_encoder/model.fp16.safetensors", 680821102),
+    ("text_encoder/model.safetensors", 1361597016), ("text_encoder/pytorch_model.bin", 1361674657),
+    ("text_encoder/pytorch_model.fp16.bin", 680900852), ("tokenizer/merges.txt", 524619),
+    ("tokenizer/vocab.json", 1059962), ("unet/config.json", 787), ("unet/diffusion_pytorch_model.bin", 5645561389),
+    ("unet/diffusion_pytorch_model.fp16.bin", 2823097059), ("unet/diffusion_pytorch_model.fp16.safetensors", 2822650226),
+    ("unet/diffusion_pytorch_model.safetensors", 5645118394), ("vae/config.json", 657),
+    ("vae/diffusion_pytorch_model.fp16.safetensors", 167335350), ("vae/diffusion_pytorch_model.safetensors", 334643276),
+]
+COMPONENTS = {"scheduler", "text_encoder", "tokenizer", "unet", "vae"}
+
+
+class FakeDownloader(titan.VideoDownloader):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.fetched = []
+
+    def _list_files(self, repo):
+        return MODELSCOPE_FILES + [("assets/demo.png", 5000), ("big-single-file.safetensors", 9e9)]
+
+    def _components(self, repo):
+        return COMPONENTS
+
+    def _fetch(self, repo, path):
+        self.fetched.append(path)
+
+
+class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_selects_only_what_diffusers_loads(self):
+        fp16 = titan.select_video_files(MODELSCOPE_FILES, COMPONENTS, "fp16")
+        paths = [p for p, _ in fp16]
+        self.assertIn("unet/diffusion_pytorch_model.fp16.safetensors", paths)
+        self.assertNotIn("unet/diffusion_pytorch_model.safetensors", paths)
+        self.assertFalse(any(p.endswith(".bin") for p in paths))
+        self.assertNotIn("README.md", paths)
+        self.assertAlmostEqual(sum(s for _, s in fp16) / 1e9, 3.67, places=2)
+        full = [p for p, _ in titan.select_video_files(MODELSCOPE_FILES, COMPONENTS, None)]
+        self.assertIn("unet/diffusion_pytorch_model.safetensors", full)
+        self.assertFalse(any(".fp16." in p for p in full))
+
+    def test_download_progress_and_marker(self):
+        cfg = titan.Config(home=self.dir, model=TINY)
+        dl = FakeDownloader(cfg)
+        self.assertEqual(dl.status("modelscope")["state"], "not downloaded")
+        self.assertEqual(dl.status("animate")["state"], "built-in")
+        seen = []
+        dl.download("modelscope", lambda path, i, n, done: seen.append((i, n)))
+        self.assertNotIn("assets/demo.png", dl.fetched)
+        self.assertNotIn("big-single-file.safetensors", dl.fetched)
+        self.assertEqual(seen[-1][0], seen[-1][1])
+        st = dl.status("modelscope")
+        self.assertEqual(st["state"], "downloaded")
+        self.assertAlmostEqual(st["bytes_total"] / 1e9, 3.67, places=2)
+        # a fresh downloader (e.g. after a restart) remembers it
+        self.assertEqual(FakeDownloader(cfg).status("modelscope")["state"], "downloaded")
+        with self.assertRaises(ValueError):
+            dl.start("animate")
+
+    def test_background_download_via_api(self):
+        b = make_brain(self.dir)
+        b.videos.downloads = FakeDownloader(b.cfg)
+        srv = titan.make_server(b, "127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            req = urllib.request.Request(base + "/v1/video/download", data=b'{"backend": "svd"}',
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as r:
+                self.assertIn(json.loads(r.read())["download"]["state"], ("downloading", "downloaded"))
+            for _ in range(100):
+                with urllib.request.urlopen(base + "/v1/video/backends") as r:
+                    svd = next(x for x in json.loads(r.read())["backends"] if x["name"] == "svd")
+                if svd["download"]["state"] == "downloaded":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(svd["download"]["state"], "downloaded")
+        finally:
+            srv.shutdown()
+            wait_trainer(b)
 
 
 class HTTPTests(unittest.TestCase):

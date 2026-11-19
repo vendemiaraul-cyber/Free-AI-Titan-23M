@@ -9,3 +9,5 @@ node_modules/
 .dev.vars
 .wrangler/
 package-lock.json
+titan-*.pt
+titan_downloads.json

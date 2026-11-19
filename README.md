@@ -3,7 +3,7 @@
 The name doesn't give any specs, but it's both downloadable or directly talkable in the browser,
 you can also connect it to an MCP server or ask it a connector (web search).
 
-Titan is a small AI (**~23M parameters, written in PyTorch**) that keeps its memory in a
+Titan is an AI **written in PyTorch, in four sizes from 23M to 1.3B parameters**, that keeps its memory in a
 Markdown file, **`TITAN.md`**. When it can't come up with an answer, it calls its teacher,
 **gpt-oss-120b on Cloudflare Workers AI**, posts an automatic message to say so, writes the
 lesson into `TITAN.md` and trains itself on it.
@@ -13,7 +13,7 @@ It comes in two editions:
 | | **Single-file edition** — `titan.py` | **Cloudflare edition** — `cloudflare/` |
 |---|---|---|
 | Where | Downloaded, runs on your device | Your Cloudflare Worker, talk to it in the browser |
-| Brain | The PyTorch Titan-23M model + `TITAN.md` | `TITAN.md` in Workers KV + gpt-oss-120b |
+| Brain | The PyTorch Titan model (23M–1.3B) + `TITAN.md` | `TITAN.md` in Workers KV + gpt-oss-120b |
 | Images | Your Perchance generator, driven automatically | Your Perchance generator (opens it) |
 | Video | All generators, on your device | Only `animate`, in your browser |
 | API | REST, OpenAI-compatible chat, MCP (stdio + HTTP) | REST, OpenAI-compatible chat, MCP (HTTP) |
@@ -50,7 +50,8 @@ you ──► Titan-23M (PyTorch) ──► confident? ──yes──► answer
 
 ```bash
 pip install torch pillow
-python titan.py train            # first training on TITAN.md (≈2.5 s/step on a laptop CPU, seconds on a GPU)
+python titan.py sizes            # the model sizes and the hardware each needs
+python titan.py train            # first training on TITAN.md (--size to pick one; default auto)
 python titan.py serve            # main page + chat UI + API on http://127.0.0.1:8023
 python titan.py chat             # terminal chat
 python titan.py ask "Who are you?"
@@ -81,6 +82,24 @@ Titan opens the generator headlessly, types the prompt, clicks generate and save
 `outputs/`. See [`perchance/README.md`](perchance/README.md) for the element IDs it looks for and
 an optional starter template. Without Playwright you get the generator link instead.
 
+### Model sizes
+
+Titan is trained from scratch on `TITAN.md`, in one of four sizes. The default, `auto`, picks the
+biggest size your machine can train. Choose one with `--size` or `TITAN_SIZE`. Each size keeps its
+own checkpoint (`titan.pt` for 23m, `titan-<size>.pt` for the others).
+
+| Size | Parameters | Layers × width | Context | Training memory | Needs |
+|---|---|---|---|---|---|
+| `23m` | 23.0M | 7 × 512 | 1,536 bytes | ~0.4 GB | any CPU |
+| `125m` | 126.7M | 15 × 832 | 2,048 bytes | ~2 GB | a GPU or Apple Silicon (slow on CPU) |
+| `350m` | 355.1M | 28 × 1024 | 2,048 bytes | ~5.7 GB | an NVIDIA GPU with 12 GB+ |
+| `1.3b` | 1.31B | 26 × 2048 | 2,048 bytes | ~21 GB | an NVIDIA GPU with 40 GB+ |
+
+Training memory is the fp32 weights plus the optimizer state; activations come on top. On CUDA,
+Titan trains in bfloat16 mixed precision. A bigger model memorises `TITAN.md` better and can say
+more, but it only knows what is in `TITAN.md`. Sizes far beyond these (such as 50B) would need a
+GPU cluster and trillions of words of training data.
+
 ### Video generators (on your device)
 
 | Backend | Type | Model | Online? |
@@ -92,8 +111,26 @@ an optional starter template. Without Playwright you get the generator link inst
 | `modelscope` | text → video | `ali-vilab/text-to-video-ms-1.7b` | device only |
 | `svd` | image → video | `stabilityai/stable-video-diffusion-img2vid-xt` | device only |
 
-Heavy backends need `pip install diffusers transformers accelerate sentencepiece imageio imageio-ffmpeg`
-and realistically an NVIDIA GPU. Weights download once on first use. Image-to-video backends
+Download them first. Their weights are big (sizes below are what Titan downloads: only the files the
+pipeline loads, never a repo's extra checkpoints):
+
+```bash
+python titan.py download              # list them, with sizes and status
+python titan.py download ltx --deps   # install the packages, then download LTX-Video
+python titan.py download all
+```
+
+or click **Download** in the Video tab of `titan.py serve`. Downloads go to the normal Hugging Face
+cache; SVD is gated, so accept its license on huggingface.co and set `HF_TOKEN` first. Running them
+realistically needs an NVIDIA GPU.
+
+| Backend | Download |
+|---|---|
+| `cogvideox` | ~13.8 GB |
+| `ltx` | ~28.4 GB |
+| `wan` | ~28.9 GB |
+| `modelscope` | ~3.7 GB |
+| `svd` | ~4.5 GB | Image-to-video backends
 animate your uploaded image, or a fresh Perchance image when none is given.
 
 ### Connect to MCP servers and the web
