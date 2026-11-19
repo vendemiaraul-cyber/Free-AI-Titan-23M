@@ -115,19 +115,3 @@ test("entry module exports only the Worker (the runtime rejects other named expo
   assert.deepEqual(Object.keys(mod), ["default"]);
   assert.equal(typeof entry.fetch, "function");
 });
-
-test("Cloudflare Pages bundle (public/_worker.js) is self-contained, current and serves the UI", async (t) => {
-  const pages = await import("../../public/_worker.js");
-  assert.deepEqual(Object.keys(pages), ["default"]);
-  const env = fakeEnv();
-  delete env.KNOWLEDGE;
-  const res = await pages.default.fetch(new Request("https://titan.pages.dev/"), env, ctx);
-  assert.match(await res.text(), /Start chatting/);
-  let esbuild;
-  try { esbuild = await import("esbuild"); } catch { return t.skip("esbuild not installed (npm install)"); }
-  const { options } = await import("../../tools/build_pages.mjs");
-  const out = await esbuild.build({ ...options, write: false });
-  const fs = await import("node:fs");
-  const committed = fs.readFileSync(new URL("../../public/_worker.js", import.meta.url), "utf8");
-  assert.equal(out.outputFiles[0].text, committed, "public/_worker.js is stale: run npm run build");
-});

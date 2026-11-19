@@ -4,11 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node tools/build_pages.mjs",
-    "build:ui": "python3 tools/build_worker_ui.py && node tools/build_pages.mjs",
-    "dev": "wrangler pages dev",
-    "deploy": "wrangler pages deploy",
-    "deploy:worker": "wrangler deploy -c cloudflare/wrangler.toml",
+    "build": "python3 tools/build_worker_ui.py",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "test": "node --test cloudflare/test/*.test.mjs && python3 -m unittest discover tests"
   },
   "devDependencies": {
