@@ -1,0 +1,1929 @@
+#!/usr/bin/env python3
+"""
+Free-AI-Titan-23M — single-file edition.
+
+Everything in one file:
+  * Titan, a ~23M-parameter byte-level transformer written in PyTorch
+  * TITAN.md, its Markdown knowledge file (retrieval + training data)
+  * Cloud learning: when Titan can't elaborate an answer it calls its teacher,
+    gpt-oss-120b on Cloudflare Workers AI, posts an automatic report message,
+    appends the answer to TITAN.md and fine-tunes itself in the background
+  * Image generator: your Perchance (perchance.org) generator, driven headlessly
+  * Video generators that run on your device (CogVideoX, LTX-Video, Wan 2.1,
+    ModelScope, Stable Video Diffusion) + "animate", which also works online
+  * Web-search connector (DuckDuckGo instant answers + Wikipedia)
+  * HTTP API (+ OpenAI-compatible /v1/chat/completions) and a browser chat UI
+  * MCP server (stdio and HTTP) and a small MCP client
+
+Quick start:
+    pip install torch pillow
+    python titan.py train          # train on TITAN.md
+    python titan.py serve          # API + browser UI on http://127.0.0.1:8023
+    python titan.py chat           # terminal chat
+    python titan.py mcp            # MCP server over stdio
+
+Configuration is by environment variable, see Config.from_env() or README.md.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import datetime as _dt
+import html
+import io
+import json
+import math
+import mimetypes
+import os
+import queue
+import random
+import re
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import asdict, dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+__version__ = "1.0.0"
+NAME = "Free-AI-Titan-23M"
+USER_AGENT = f"{NAME}/{__version__} (+https://github.com/vendemiaraul-cyber/Free-AI-Titan-23M)"
+TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
+
+
+def log(*args: Any) -> None:
+    print("[titan]", *args, file=sys.stderr, flush=True)
+
+
+def today() -> str:
+    return _dt.date.today().isoformat()
+
+
+# =============================================================================
+# 0. Configuration
+# =============================================================================
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 258        # 256 bytes + BOS + EOS
+    n_layer: int = 7
+    n_head: int = 8
+    d_model: int = 512
+    ctx: int = 1536
+    dropout: float = 0.0
+
+
+@dataclass
+class Config:
+    home: Path = Path(__file__).resolve().parent
+    model: ModelConfig = field(default_factory=ModelConfig)
+    # cloud teacher: either your deployed worker, or Cloudflare's REST API directly
+    cloud_url: str = ""            # TITAN_CLOUD_URL  e.g. https://free-ai-titan-23m.<you>.workers.dev
+    cloud_key: str = ""            # TITAN_API_KEY    bearer key of your worker (optional)
+    cf_account_id: str = ""        # TITAN_CF_ACCOUNT_ID  (direct mode)
+    cf_api_token: str = ""         # TITAN_CF_API_TOKEN   (direct mode)
+    teacher_model: str = TEACHER_MODEL
+    web_fallback: bool = True      # learn from Wikipedia if the cloud is unreachable
+    # perchance image generator
+    perchance_url: str = ""        # TITAN_PERCHANCE_URL e.g. https://perchance.org/my-titan-images
+    perchance_prompt_selector: str = "#prompt, textarea, input[type=text]"
+    perchance_negative_selector: str = "#negative"
+    perchance_button_selector: str = "#generateBtn, #generate, button"
+    perchance_timeout: int = 120
+    # MCP servers to connect to (client side)
+    mcp_servers: list = field(default_factory=list)
+    # answering
+    conf_threshold: float = 0.40   # below this geometric-mean token prob -> can't elaborate
+    high_conf: float = 0.85        # confident enough to answer without a knowledge hit
+    sim_threshold: float = 0.30    # knowledge hit counts as relevant above this
+    recall_threshold: float = 0.55 # strong hit: answer from TITAN.md if the model fails
+    temperature: float = 0.6
+    top_k: int = 40
+    max_new_tokens: int = 480
+    # training
+    auto_train: bool = True        # bootstrap-train in the background if no checkpoint exists
+    bootstrap_steps: int = 300
+    learn_steps: int = 30
+    batch_size: int = 8
+    lr: float = 3e-4
+    learn_lr: float = 1.5e-4
+    # API
+    local_key: str = ""            # TITAN_LOCAL_KEY: require this bearer key on the local API
+
+    @property
+    def md_path(self) -> Path:
+        return self.home / "TITAN.md"
+
+    @property
+    def ckpt_path(self) -> Path:
+        return self.home / "titan.pt"
+
+    @property
+    def reports_path(self) -> Path:
+        return self.home / "titan_reports.jsonl"
+
+    @property
+    def out_dir(self) -> Path:
+        p = self.home / "outputs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        e = os.environ.get
+        c = cls()
+        if e("TITAN_HOME"):
+            c.home = Path(e("TITAN_HOME")).expanduser().resolve()
+            c.home.mkdir(parents=True, exist_ok=True)
+        c.cloud_url = e("TITAN_CLOUD_URL", "").rstrip("/")
+        c.cloud_key = e("TITAN_API_KEY", "")
+        c.cf_account_id = e("TITAN_CF_ACCOUNT_ID", "")
+        c.cf_api_token = e("TITAN_CF_API_TOKEN", "")
+        c.teacher_model = e("TITAN_TEACHER_MODEL", TEACHER_MODEL)
+        c.web_fallback = e("TITAN_WEB_FALLBACK", "1") != "0"
+        c.perchance_url = e("TITAN_PERCHANCE_URL", "")
+        c.perchance_prompt_selector = e("TITAN_PERCHANCE_PROMPT_SELECTOR", c.perchance_prompt_selector)
+        c.perchance_negative_selector = e("TITAN_PERCHANCE_NEGATIVE_SELECTOR", c.perchance_negative_selector)
+        c.perchance_button_selector = e("TITAN_PERCHANCE_BUTTON_SELECTOR", c.perchance_button_selector)
+        c.mcp_servers = [u.strip() for u in e("TITAN_MCP_SERVERS", "").split(",") if u.strip()]
+        c.auto_train = e("TITAN_AUTO_TRAIN", "1") != "0"
+        c.local_key = e("TITAN_LOCAL_KEY", "")
+        for name, cast in (("conf_threshold", float), ("sim_threshold", float), ("learn_steps", int),
+                           ("bootstrap_steps", int), ("batch_size", int), ("temperature", float)):
+            v = e("TITAN_" + name.upper())
+            if v:
+                setattr(c, name, cast(v))
+        return c
+
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# =============================================================================
+# 1. TITAN.md knowledge base
+# =============================================================================
+
+ENTRY_RE = re.compile(r"^### Q:[ \t]*(.+?)[ \t]*\n(.*?)(?=^### Q:|^## |\Z)", re.S | re.M)
+META_RE = re.compile(r"<!--(.*?)-->", re.S)
+WORD_RE = re.compile(r"[a-z0-9]+")
+STOPWORDS = set("""a an the is are was were be been am do does did of to in on at for and or but
+with by from as it its this that these those i you he she we they me my your our their what
+which who whom how why when where can could would should will shall may might please tell
+about there here have has had so if then than just also not no yes hey""".split())
+
+DEFAULT_MD = """# TITAN.md — Knowledge of Free-AI-Titan-23M
+
+Titan's memory. Entries are added automatically when the cloud teacher (gpt-oss-120b on
+Cloudflare Workers AI) teaches Titan something it couldn't answer.
+
+## Knowledge
+"""
+
+
+def words(text: str) -> list[str]:
+    return [w for w in WORD_RE.findall(text.lower()) if w not in STOPWORDS]
+
+
+def _stem(w: str) -> str:
+    for suf in ("ing", "ies", "es", "ed", "s"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
+@dataclass
+class Entry:
+    id: int
+    question: str
+    answer: str
+    meta: dict
+
+    def to_md(self) -> str:
+        meta = " | ".join(f"{k}: {v}" for k, v in self.meta.items())
+        return f"### Q: {self.question}\nA: {self.answer}\n<!-- {meta} -->\n"
+
+
+class KnowledgeBase:
+    """Parses, searches and appends to TITAN.md."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.RLock()
+        if not self.path.exists():
+            self.path.write_text(DEFAULT_MD, encoding="utf-8")
+        self.entries: list[Entry] = []
+        self.reload()
+
+    # -- parsing ---------------------------------------------------------------
+    @staticmethod
+    def parse(text: str) -> list[Entry]:
+        out = []
+        for i, m in enumerate(ENTRY_RE.finditer(text)):
+            q, body = m.group(1).strip(), m.group(2)
+            meta = {}
+            for mm in META_RE.finditer(body):
+                for part in mm.group(1).split("|"):
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        meta[k.strip()] = v.strip()
+            body = META_RE.sub("", body).strip()
+            if body.startswith("A:"):
+                body = body[2:].strip()
+            if q and body:
+                out.append(Entry(i + 1, q, body, meta))
+        return out
+
+    def reload(self) -> None:
+        with self.lock:
+            self.text = self.path.read_text(encoding="utf-8")
+            self.entries = self.parse(self.text)
+            self._index()
+
+    def _index(self) -> None:
+        docs = [[_stem(w) for w in words(e.question)] for e in self.entries]
+        ans = [[_stem(w) for w in words(e.answer)] for e in self.entries]
+        n = max(len(docs), 1)
+        df: dict[str, int] = {}
+        for d, a in zip(docs, ans):
+            for w in set(d) | set(a):
+                df[w] = df.get(w, 0) + 1
+        self.idf = {w: math.log(1 + n / c) for w, c in df.items()}
+        self.vecs = [(self._vec(d), self._vec(a)) for d, a in zip(docs, ans)]
+
+    def _vec(self, toks: list[str]) -> dict:
+        v: dict[str, float] = {}
+        for t in toks:
+            v[t] = v.get(t, 0.0) + self.idf.get(t, math.log(1 + max(len(self.entries), 1)))
+        norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        return {k: x / norm for k, x in v.items()}
+
+    @staticmethod
+    def _cos(a: dict, b: dict) -> float:
+        if len(a) > len(b):
+            a, b = b, a
+        return sum(x * b.get(k, 0.0) for k, x in a.items())
+
+    def search(self, query: str, k: int = 3) -> list[tuple[float, Entry]]:
+        with self.lock:
+            qtok = [_stem(w) for w in words(query)]
+            if not qtok:  # e.g. "hi" is not a stopword, but "how are you" is all stopwords
+                low = query.strip().lower().rstrip("?!. ")
+                exact = [(1.0, e) for e in self.entries if e.question.lower().rstrip("?!. ") == low]
+                return exact[:k]
+            qv = self._vec(qtok)
+            scored = []
+            for e, (dv, av) in zip(self.entries, self.vecs):
+                s = 0.8 * self._cos(qv, dv) + 0.2 * self._cos(qv, av)
+                if e.question.strip().lower().rstrip("?!. ") == query.strip().lower().rstrip("?!. "):
+                    s = 1.0
+                scored.append((s, e))
+            scored.sort(key=lambda t: -t[0])
+            return [t for t in scored[:k] if t[0] > 0]
+
+    # -- writing ---------------------------------------------------------------
+    def find_exact(self, question: str) -> Optional[Entry]:
+        q = question.strip().lower().rstrip("?!. ")
+        for e in self.entries:
+            if e.question.strip().lower().rstrip("?!. ") == q:
+                return e
+        return None
+
+    def add(self, question: str, answer: str, source: str) -> Entry:
+        question = " ".join(question.split())[:300]
+        answer = answer.strip()
+        answer = re.sub(r"\n(?=### |## )", "\n​", answer)  # never break the file structure
+        answer = answer.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+        with self.lock:
+            self.reload()
+            old = self.find_exact(question)
+            meta = {"source": source, "added": today()}
+            if old:  # replace the old answer in place
+                pattern = re.compile(r"^### Q:[ \t]*" + re.escape(old.question) + r"[ \t]*\n.*?(?=^### Q:|^## |\Z)",
+                                     re.S | re.M)
+                new = Entry(old.id, old.question, answer, meta).to_md() + "\n"
+                text = pattern.sub(lambda _m: new, self.text, count=1)
+            else:
+                text = self.text.rstrip("\n") + "\n\n" + Entry(0, question, answer, meta).to_md()
+            self.path.write_text(text, encoding="utf-8")
+            self.reload()
+            return self.find_exact(question)  # type: ignore[return-value]
+
+    def merge_markdown(self, text: str) -> int:
+        """Add entries from another TITAN.md that we don't have yet. Returns count added."""
+        added = 0
+        for e in self.parse(text):
+            if not self.find_exact(e.question):
+                self.add(e.question, e.answer, e.meta.get("source", "sync"))
+                added += 1
+        return added
+
+
+# =============================================================================
+# 2. Tokenizer + the Titan transformer (PyTorch)
+# =============================================================================
+
+BOS, EOS = 256, 257
+
+
+def encode(text: str) -> list[int]:
+    return list(text.encode("utf-8"))
+
+
+def decode(ids: list[int]) -> str:
+    return bytes(i for i in ids if i < 256).decode("utf-8", errors="replace")
+
+
+def format_prompt(question: str, knowledge: str = "") -> str:
+    knowledge = knowledge.replace("\n", " ")
+    return f"### Knowledge: {knowledge[:600]}\n### User: {question[:300]}\n### Titan:"
+
+
+class Attention(nn.Module):
+    def __init__(self, c: ModelConfig):
+        super().__init__()
+        self.n_head, self.d = c.n_head, c.d_model
+        self.qkv = nn.Linear(c.d_model, 3 * c.d_model)
+        self.proj = nn.Linear(c.d_model, c.d_model)
+        self.dropout = c.dropout
+
+    def forward(self, x: torch.Tensor, cache: Optional[dict] = None) -> torch.Tensor:
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        hd = C // self.n_head
+        q, k, v = (t.view(B, T, self.n_head, hd).transpose(1, 2) for t in (q, k, v))
+        prefix = 0
+        if cache is not None:
+            if "k" in cache:
+                prefix = cache["k"].size(2)
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+        if T > 1 and prefix:  # chunk after a prefix: explicit causal mask with offset
+            mask = torch.ones(T, prefix + T, dtype=torch.bool, device=x.device).tril(prefix)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=T > 1, dropout_p=self.dropout if self.training else 0.0)
+        return self.proj(y.transpose(1, 2).contiguous().view(B, T, C))
+
+
+class Block(nn.Module):
+    def __init__(self, c: ModelConfig):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(c.d_model), nn.LayerNorm(c.d_model)
+        self.attn = Attention(c)
+        self.mlp = nn.Sequential(nn.Linear(c.d_model, 4 * c.d_model), nn.GELU(),
+                                 nn.Linear(4 * c.d_model, c.d_model), nn.Dropout(c.dropout))
+
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.ln1(x), cache)
+        return x + self.mlp(self.ln2(x))
+
+
+class Titan(nn.Module):
+    """GPT-style decoder over UTF-8 bytes. Default config = ~23M parameters."""
+
+    def __init__(self, c: ModelConfig):
+        super().__init__()
+        self.config = c
+        self.tok = nn.Embedding(c.vocab_size, c.d_model)
+        self.pos = nn.Embedding(c.ctx, c.d_model)
+        self.drop = nn.Dropout(c.dropout)
+        self.blocks = nn.ModuleList(Block(c) for _ in range(c.n_layer))
+        self.ln_f = nn.LayerNorm(c.d_model)
+        self.head = nn.Linear(c.d_model, c.vocab_size, bias=False)
+        self.head.weight = self.tok.weight  # weight tying
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def forward(self, idx, targets=None, caches=None, pos_offset: int = 0):
+        B, T = idx.shape
+        pos = torch.arange(pos_offset, pos_offset + T, device=idx.device)
+        x = self.drop(self.tok(idx) + self.pos(pos))
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, caches[i] if caches is not None else None)
+        logits = self.head(self.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, prompt: list[int], max_new: int = 400, temperature: float = 0.6,
+                 top_k: int = 40, stop_text: str = "\n###") -> tuple[list[int], list[float]]:
+        """Sample with a KV cache. Returns (new token ids, log-probs under the untempered model)."""
+        self.eval()
+        dev = next(self.parameters()).device
+        ctx = self.config.ctx
+        max_new = max(1, min(max_new, ctx // 2))
+        prompt = prompt[-(ctx - max_new):]
+        caches = [dict() for _ in self.blocks]
+        logits, _ = self(torch.tensor([prompt], device=dev), caches=caches)
+        logits = logits[0, -1].float()
+        pos = len(prompt)
+        out, logps = [], []
+        stop = encode(stop_text)
+        for _ in range(max_new):
+            lp = F.log_softmax(logits, dim=-1)
+            if temperature <= 0:
+                tok = int(torch.argmax(logits))
+            else:
+                l2 = logits / temperature
+                if top_k:
+                    kth = torch.topk(l2, min(top_k, l2.numel())).values[-1]
+                    l2 = l2.masked_fill(l2 < kth, float("-inf"))
+                tok = int(torch.multinomial(F.softmax(l2, dim=-1), 1))
+            logps.append(float(lp[tok]))
+            if tok == EOS or tok == BOS:
+                break
+            out.append(tok)
+            if stop and out[-len(stop):] == stop:
+                out = out[:-len(stop)]
+                break
+            if pos >= ctx:
+                break
+            logits, _ = self(torch.tensor([[tok]], device=dev), caches=caches, pos_offset=pos)
+            logits = logits[0, -1].float()
+            pos += 1
+        return out, logps
+
+
+# =============================================================================
+# 3. Training
+# =============================================================================
+
+def make_example(e: Entry, with_knowledge: bool, ctx: int) -> tuple[list[int], list[int]]:
+    q = random.choice([e.question, e.question.lower(), e.question.rstrip("?!. ")])
+    prompt = [BOS] + encode(format_prompt(q, e.answer if with_knowledge else ""))
+    target = encode(" " + e.answer[:600]) + [EOS]
+    ids = (prompt + target)[: ctx + 1]
+    labels = ([-100] * len(prompt) + target)[: ctx + 1]
+    return ids[:-1], labels[1:]
+
+
+def make_batch(entries: list[Entry], ctx: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    exs = [make_example(e, random.random() < 0.5, ctx) for e in entries]
+    T = max(len(x) for x, _ in exs)
+    X = torch.zeros(len(exs), T, dtype=torch.long)
+    Y = torch.full((len(exs), T), -100, dtype=torch.long)
+    for i, (x, y) in enumerate(exs):
+        X[i, : len(x)] = torch.tensor(x)
+        Y[i, : len(y)] = torch.tensor(y)
+    return X.to(device), Y.to(device)
+
+
+def train_steps(model: Titan, entries: list[Entry], steps: int, lr: float, batch_size: int,
+                focus: Optional[list[Entry]] = None, on_step: Optional[Callable] = None) -> list[float]:
+    """Train `model` in place. With `focus`, half of every batch is the focus entries (replay for the rest)."""
+    if not entries:
+        return []
+    dev = next(model.parameters()).device
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
+    model.train()
+    losses = []
+    for step in range(steps):
+        if focus:
+            nf = max(1, batch_size // 2)
+            batch = [random.choice(focus) for _ in range(nf)] + random.sample(entries, min(len(entries), batch_size - nf))
+        else:
+            batch = random.sample(entries, min(len(entries), batch_size))
+        X, Y = make_batch(batch, model.config.ctx, dev)
+        warm = min(1.0, (step + 1) / 10)
+        for g in opt.param_groups:
+            g["lr"] = lr * warm
+        _, loss = model(X, Y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        losses.append(loss.item())
+        if on_step:
+            on_step(step, losses[-1])
+    model.eval()
+    return losses
+
+
+class BackgroundTrainer:
+    """Trains a copy of the live model off-thread, then swaps the weights in."""
+
+    def __init__(self, brain: "Brain"):
+        self.brain = brain
+        self.q: "queue.Queue[dict]" = queue.Queue()
+        self.busy = False
+        self.pending_ids: set[str] = set()
+        self.history: list[dict] = []
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="titan-trainer")
+        self.thread.start()
+
+    def submit(self, kind: str, questions: Optional[list[str]] = None, steps: Optional[int] = None) -> bool:
+        key = kind + ":" + "|".join(questions or [])
+        if key in self.pending_ids:
+            return False
+        self.pending_ids.add(key)
+        self.q.put({"key": key, "kind": kind, "questions": questions or [], "steps": steps})
+        return True
+
+    def status(self) -> dict:
+        return {"busy": self.busy, "queued": self.q.qsize(), "recent": self.history[-5:]}
+
+    def _loop(self):
+        while True:
+            job = self.q.get()
+            self.busy = True
+            t0 = time.time()
+            try:
+                b = self.brain
+                entries = list(b.kb.entries)
+                focus = [e for e in entries if e.question in job["questions"]] or None
+                if job["kind"] == "bootstrap":
+                    steps, lr = job["steps"] or b.cfg.bootstrap_steps, b.cfg.lr
+                else:
+                    steps, lr = job["steps"] or b.cfg.learn_steps, b.cfg.learn_lr
+                with b.model_lock:
+                    work = copy.deepcopy(b.model)
+                losses = train_steps(work, entries, steps, lr, b.cfg.batch_size, focus=focus)
+                with b.model_lock:
+                    b.model.load_state_dict(work.state_dict())
+                    b.trained_steps += steps
+                b.save()
+                rec = {"kind": job["kind"], "questions": job["questions"], "steps": steps,
+                       "loss": round(sum(losses[-5:]) / max(1, len(losses[-5:])), 4),
+                       "seconds": round(time.time() - t0, 1), "finished": time.strftime("%H:%M:%S")}
+                self.history.append(rec)
+                log(f"training done: {rec}")
+            except Exception:  # never kill the thread
+                log("training failed:\n" + traceback.format_exc())
+            finally:
+                self.pending_ids.discard(job["key"])
+                self.busy = False
+
+
+# =============================================================================
+# 4. Connectors: HTTP helper, web search, cloud teacher (gpt-oss-120b)
+# =============================================================================
+
+def http_json(url: str, data: Any = None, headers: Optional[dict] = None, timeout: int = 60,
+              method: Optional[str] = None) -> Any:
+    body = None if data is None else json.dumps(data).encode()
+    h = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=body, headers=h, method=method or ("POST" if body else "GET"))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw.decode() or "null")
+
+
+def web_search(query: str, limit: int = 3) -> dict:
+    """Free web-search connector: DuckDuckGo instant answers + Wikipedia."""
+    results, abstract = [], ""
+    try:
+        d = http_json("https://api.duckduckgo.com/?" + urllib.parse.urlencode(
+            {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}), timeout=15)
+        abstract = d.get("AbstractText") or d.get("Answer") or ""
+        if abstract:
+            results.append({"title": d.get("Heading") or query, "url": d.get("AbstractURL", ""),
+                            "snippet": abstract, "source": "duckduckgo"})
+    except Exception as ex:
+        log("duckduckgo failed:", ex)
+    try:
+        d = http_json("https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
+            "action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": limit,
+            "prop": "extracts|info", "exintro": 1, "explaintext": 1, "exsentences": 3,
+            "inprop": "url", "format": "json"}), timeout=15)
+        pages = sorted((d.get("query") or {}).get("pages", {}).values(), key=lambda p: p.get("index", 0))
+        for p in pages:
+            results.append({"title": p.get("title"), "url": p.get("fullurl", ""),
+                            "snippet": (p.get("extract") or "").strip(), "source": "wikipedia"})
+    except Exception as ex:
+        log("wikipedia failed:", ex)
+    return {"query": query, "results": results[: limit + 1]}
+
+
+class TeacherUnavailable(Exception):
+    pass
+
+
+TEACHER_SYSTEM = (
+    "You are the teacher of Titan-23M, a tiny 23M-parameter AI that learns from your answers. "
+    "Titan could not answer the user's question by itself. Write the answer Titan should learn: "
+    "correct, self-contained, friendly, plain text (no Markdown headings, no tables), at most 80 words. "
+    "If the question needs real-time information you don't have, say so briefly."
+)
+
+
+def extract_llm_text(res: Any) -> str:
+    """Pull the answer text out of any Workers AI / OpenAI-shaped response."""
+    if isinstance(res, dict) and "result" in res and isinstance(res["result"], (dict, str)):
+        res = res["result"]
+    if isinstance(res, str):
+        return res.strip()
+    if not isinstance(res, dict):
+        return ""
+    if isinstance(res.get("response"), str):
+        return res["response"].strip()
+    if res.get("output_text"):
+        return str(res["output_text"]).strip()
+    for ch in res.get("choices") or []:
+        msg = ch.get("message") or {}
+        if msg.get("content"):
+            return str(msg["content"]).strip()
+        if ch.get("text"):
+            return str(ch["text"]).strip()
+    texts = []
+    for item in res.get("output") or []:  # Responses API shape
+        if item.get("type") == "message":
+            for c in item.get("content") or []:
+                if c.get("type") in ("output_text", "text") and c.get("text"):
+                    texts.append(c["text"])
+    return "\n".join(texts).strip()
+
+
+class CloudTeacher:
+    """Asks gpt-oss-120b on Cloudflare for an answer, via your Worker or the REST API."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    @property
+    def mode(self) -> str:
+        if self.cfg.cloud_url:
+            return "worker"
+        if self.cfg.cf_account_id and self.cfg.cf_api_token:
+            return "cloudflare-api"
+        return "none"
+
+    def teach(self, question: str, context: list[Entry], draft: str, confidence: float, reason: str) -> dict:
+        ctx_md = "\n".join(e.to_md() for e in context[:3])
+        if self.mode == "worker":
+            h = {"Authorization": f"Bearer {self.cfg.cloud_key}"} if self.cfg.cloud_key else {}
+            r = http_json(self.cfg.cloud_url + "/v1/teach", {
+                "question": question, "context": ctx_md, "draft": draft[:400],
+                "confidence": round(confidence, 4), "reason": reason, "client": f"titan.py/{__version__}",
+            }, headers=h, timeout=120)
+            if not r or not r.get("answer"):
+                raise TeacherUnavailable(f"worker returned no answer: {r}")
+            return {"answer": r["answer"], "model": r.get("model", self.cfg.teacher_model),
+                    "report_id": r.get("report_id", ""), "via": "worker"}
+        if self.mode == "cloudflare-api":
+            url = (f"https://api.cloudflare.com/client/v4/accounts/{self.cfg.cf_account_id}"
+                   f"/ai/run/{self.cfg.teacher_model}")
+            user = f"Question: {question}"
+            if ctx_md:
+                user += f"\n\nWhat Titan already knows (may be unrelated):\n{ctx_md}"
+            r = http_json(url, {"messages": [{"role": "system", "content": TEACHER_SYSTEM},
+                                             {"role": "user", "content": user}]},
+                          headers={"Authorization": f"Bearer {self.cfg.cf_api_token}"}, timeout=120)
+            text = extract_llm_text(r)
+            if not text:
+                raise TeacherUnavailable(f"empty answer from {self.cfg.teacher_model}")
+            return {"answer": text, "model": self.cfg.teacher_model, "report_id": "", "via": "cloudflare-api"}
+        raise TeacherUnavailable("no cloud configured (set TITAN_CLOUD_URL, or TITAN_CF_ACCOUNT_ID + TITAN_CF_API_TOKEN)")
+
+
+# =============================================================================
+# 5. Image generator — your Perchance generator
+# =============================================================================
+
+def _sniff_ext(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return "png"
+
+
+_COLLECT_JS = """() => Array.from(document.images)
+  .filter(i => i.complete && i.naturalWidth >= 256 && i.naturalHeight >= 256)
+  .map(i => i.currentSrc || i.src)"""
+
+_BLOB_JS = """async (src) => { const r = await fetch(src); const b = await r.blob();
+  return await new Promise(res => { const f = new FileReader(); f.onload = () => res(f.result); f.readAsDataURL(b); }); }"""
+
+
+class PerchanceImageGenerator:
+    """Drives your perchance.org generator in a headless browser and saves the image it makes.
+
+    Your generator needs a prompt box and a button; by default Titan looks for
+    #prompt (or the first textarea / text input), an optional #negative box and
+    #generateBtn (or the first button). Override with TITAN_PERCHANCE_*_SELECTOR.
+    Without Playwright, Titan returns the generator URL to open in a browser instead.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def status(self) -> dict:
+        try:
+            import playwright  # noqa: F401
+            pw = True
+        except ImportError:
+            pw = False
+        return {"backend": "perchance", "generator_url": self.cfg.perchance_url or None,
+                "configured": bool(self.cfg.perchance_url), "headless": pw,
+                "note": None if pw else "pip install playwright && playwright install chromium for automatic images"}
+
+    def generate(self, prompt: str, negative: str = "", timeout: Optional[int] = None) -> dict:
+        url = self.cfg.perchance_url
+        if not url:
+            return {"ok": False, "mode": "unconfigured",
+                    "message": "Set TITAN_PERCHANCE_URL to your perchance.org generator (e.g. https://perchance.org/my-titan-images)."}
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return {"ok": False, "mode": "browser", "url": url, "prompt": prompt,
+                    "message": "Playwright isn't installed, so open your Perchance generator and paste the prompt there."}
+        timeout = timeout or self.cfg.perchance_timeout
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page(viewport={"width": 1280, "height": 1000})
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                frame = self._find_frame(page, self.cfg.perchance_prompt_selector, 45)
+                before = {s for _, s in self._collect(page)}
+                frame.fill(self.cfg.perchance_prompt_selector, prompt)
+                if negative:
+                    try:
+                        if frame.query_selector(self.cfg.perchance_negative_selector):
+                            frame.fill(self.cfg.perchance_negative_selector, negative)
+                    except Exception:
+                        pass
+                frame.click(self.cfg.perchance_button_selector)
+                deadline = time.time() + timeout
+                found = None
+                while time.time() < deadline and not found:
+                    page.wait_for_timeout(1500)
+                    new = [(f, s) for f, s in self._collect(page) if s not in before]
+                    found = new[-1] if new else None
+                if not found:
+                    shot = page.screenshot(full_page=True)
+                    path = self._save(shot, "png", "perchance_screenshot")
+                    return {"ok": False, "mode": "timeout", "url": url, "file": str(path),
+                            "message": f"No new image appeared within {timeout}s; saved a screenshot instead."}
+                frame_with, src = found
+                data = self._fetch(page, frame_with, src)
+                path = self._save(data, _sniff_ext(data), "image")
+                return {"ok": True, "mode": "headless", "url": url, "file": str(path), "prompt": prompt}
+            finally:
+                browser.close()
+
+    @staticmethod
+    def _find_frame(page, selector: str, seconds: int):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            for f in page.frames:
+                try:
+                    if f.query_selector(selector):
+                        return f
+                except Exception:
+                    pass
+            page.wait_for_timeout(500)
+        raise RuntimeError(f"couldn't find the prompt box ({selector}) on the Perchance page")
+
+    @staticmethod
+    def _collect(page) -> list:
+        out = []
+        for f in page.frames:
+            try:
+                out += [(f, s) for s in f.evaluate(_COLLECT_JS) if s]
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
+    def _fetch(page, frame, src: str) -> bytes:
+        if src.startswith("data:"):
+            return base64.b64decode(src.split(",", 1)[1])
+        if src.startswith("blob:"):
+            return base64.b64decode(frame.evaluate(_BLOB_JS, src).split(",", 1)[1])
+        return page.request.get(src).body()
+
+    def _save(self, data: bytes, ext: str, stem: str) -> Path:
+        path = self.cfg.out_dir / f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.{ext}"
+        path.write_bytes(data)
+        return path
+
+
+# =============================================================================
+# 6. Video generators — run on your device (only "animate" also works online)
+# =============================================================================
+
+VIDEO_BACKENDS: dict[str, dict] = {
+    "animate": {"kind": "image-to-video", "online": True, "gpu": False,
+                "description": "Ken Burns zoom/pan over an image (your Perchance image or an upload). "
+                               "Runs anywhere, also in the browser edition."},
+    "cogvideox": {"kind": "text-to-video", "online": False, "gpu": True, "model": "THUDM/CogVideoX-2b",
+                  "pipeline": "CogVideoXPipeline", "description": "CogVideoX-2B, 6 s clips, ~12 GB VRAM with offload."},
+    "ltx": {"kind": "text-to-video", "online": False, "gpu": True, "model": "Lightricks/LTX-Video",
+            "pipeline": "LTXPipeline", "description": "LTX-Video, fast text-to-video."},
+    "wan": {"kind": "text-to-video", "online": False, "gpu": True, "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            "pipeline": "WanPipeline", "description": "Wan 2.1 1.3B, ~8 GB VRAM."},
+    "modelscope": {"kind": "text-to-video", "online": False, "gpu": True, "model": "ali-vilab/text-to-video-ms-1.7b",
+                   "pipeline": "DiffusionPipeline", "description": "ModelScope 1.7B, small and old but light."},
+    "svd": {"kind": "image-to-video", "online": False, "gpu": True,
+            "model": "stabilityai/stable-video-diffusion-img2vid-xt", "pipeline": "StableVideoDiffusionPipeline",
+            "description": "Stable Video Diffusion XT: animates an image (accept its license on Hugging Face first)."},
+}
+
+
+def _has(mod: str) -> bool:
+    try:
+        __import__(mod)
+        return True
+    except ImportError:
+        return False
+
+
+class VideoGenerator:
+    def __init__(self, cfg: Config, images: PerchanceImageGenerator):
+        self.cfg, self.images = cfg, images
+        self._pipes: dict[str, Any] = {}
+        self.lock = threading.Lock()
+
+    def backends(self) -> list[dict]:
+        cuda = torch.cuda.is_available()
+        out = []
+        for name, spec in VIDEO_BACKENDS.items():
+            deps = ["PIL"] if name == "animate" else ["diffusers", "transformers", "PIL"]
+            missing = [d for d in deps if not _has(d)]
+            out.append({"name": name, **{k: v for k, v in spec.items() if k != "pipeline"},
+                        "available": not missing, "missing": missing,
+                        "where": "device + browser" if spec["online"] else "device only",
+                        "warning": None if (not spec["gpu"] or cuda) else "no CUDA GPU found: will be very slow on CPU"})
+        return out
+
+    def generate(self, prompt: str, backend: str = "animate", image: Optional[bytes] = None,
+                 frames: Optional[int] = None, fps: int = 12, steps: Optional[int] = None,
+                 seed: Optional[int] = None, negative: str = "") -> dict:
+        if backend not in VIDEO_BACKENDS:
+            raise ValueError(f"unknown video backend {backend!r}; choose from {list(VIDEO_BACKENDS)}")
+        seed = random.randint(0, 2**31 - 1) if seed is None else seed
+        notes = []
+        pil = None
+        if image:
+            from PIL import Image
+            pil = Image.open(io.BytesIO(image)).convert("RGB")
+        elif VIDEO_BACKENDS[backend]["kind"] == "image-to-video":
+            r = self.images.generate(prompt) if self.cfg.perchance_url else {"ok": False}
+            if r.get("ok"):
+                from PIL import Image
+                pil = Image.open(r["file"]).convert("RGB")
+                notes.append(f"first frame generated by Perchance: {Path(r['file']).name}")
+            else:
+                pil = title_card(prompt)
+                notes.append("no image given and Perchance unavailable: animated a title card")
+        with self.lock:
+            if backend == "animate":
+                vid = animate_image(pil, frames or 48)
+                fps = fps or 12
+            else:
+                vid, fps = self._diffusers(backend, prompt, pil, frames, fps, steps, seed, negative)
+        path = save_video(vid, fps, self.cfg.out_dir / f"video_{backend}_{time.strftime('%Y%m%d_%H%M%S')}")
+        return {"ok": True, "backend": backend, "file": str(path), "frames": len(vid), "fps": fps,
+                "seed": seed, "notes": notes}
+
+    def _diffusers(self, name, prompt, pil, frames, fps, steps, seed, negative):
+        import diffusers
+        spec = VIDEO_BACKENDS[name]
+        cuda = torch.cuda.is_available()
+        dtype = torch.bfloat16 if (cuda and name in ("cogvideox", "ltx", "wan")) else (torch.float16 if cuda else torch.float32)
+        pipe = self._pipes.get(name)
+        if pipe is None:
+            log(f"loading {spec['model']} (first run downloads the weights)…")
+            kw: dict[str, Any] = {"torch_dtype": dtype}
+            if name == "wan":
+                kw["vae"] = diffusers.AutoencoderKLWan.from_pretrained(spec["model"], subfolder="vae",
+                                                                       torch_dtype=torch.float32)
+            if name == "svd" and cuda:
+                kw["variant"] = "fp16"
+            pipe = getattr(diffusers, spec["pipeline"]).from_pretrained(spec["model"], **kw)
+            if cuda:
+                try:
+                    pipe.enable_model_cpu_offload()
+                except Exception:
+                    pipe.to("cuda")
+            else:
+                pipe.to(pick_device() if pick_device().type == "mps" else "cpu")
+            for m in ("enable_vae_slicing", "enable_vae_tiling"):
+                if hasattr(pipe, m) and name != "svd":
+                    try:
+                        getattr(pipe, m)()
+                    except Exception:
+                        pass
+            self._pipes = {name: pipe}  # keep only one big model in memory
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        neg = negative or "blurry, low quality, distorted, watermark, text"
+        if name == "svd":
+            res = pipe(pil.resize((1024, 576)), num_frames=frames or 25, decode_chunk_size=4, generator=g,
+                       num_inference_steps=steps or 25)
+            fps = fps or 7
+        elif name == "cogvideox":
+            res = pipe(prompt=prompt, num_frames=frames or 49, num_inference_steps=steps or 50,
+                       guidance_scale=6.0, generator=g)
+            fps = fps or 8
+        elif name == "ltx":
+            n = frames or 97
+            n = (n - 1) // 8 * 8 + 1
+            res = pipe(prompt=prompt, negative_prompt=neg, width=704, height=480, num_frames=n,
+                       num_inference_steps=steps or 40, generator=g)
+            fps = fps or 24
+        elif name == "wan":
+            n = frames or 33
+            n = (n - 1) // 4 * 4 + 1
+            res = pipe(prompt=prompt, negative_prompt=neg, height=480, width=832, num_frames=n,
+                       guidance_scale=5.0, num_inference_steps=steps or 30, generator=g)
+            fps = fps or 16
+        else:  # modelscope
+            res = pipe(prompt, num_frames=frames or 16, num_inference_steps=steps or 25, generator=g)
+            fps = fps or 8
+        return _to_pil_frames(res.frames[0]), fps
+
+
+def _to_pil_frames(frames) -> list:
+    from PIL import Image
+    out = []
+    for f in frames:
+        if isinstance(f, Image.Image):
+            out.append(f.convert("RGB"))
+        else:
+            import numpy as np
+            a = np.asarray(f)
+            if a.dtype != np.uint8:
+                a = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+            out.append(Image.fromarray(a).convert("RGB"))
+    return out
+
+
+def title_card(text: str, size=(768, 432)):
+    from PIL import Image, ImageDraw
+    w, h = size
+    img = Image.new("RGB", size)
+    d = ImageDraw.Draw(img)
+    for y in range(h):  # vertical gradient
+        t = y / h
+        d.line([(0, y), (w, y)], fill=(int(20 + 40 * t), int(24 + 30 * t), int(60 + 120 * t)))
+    lines, cur = [], ""
+    for wd in text.split():
+        if len(cur) + len(wd) > 34:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = (cur + " " + wd).strip()
+    lines.append(cur)
+    y0 = h // 2 - 12 * len(lines[:6])
+    for i, ln in enumerate(lines[:6]):
+        d.text((48, y0 + 24 * i), ln, fill=(240, 240, 255))
+    return img
+
+
+def animate_image(img, n_frames: int = 48, size=(768, 432)) -> list:
+    """Ken Burns effect: slow zoom-in with a gentle pan."""
+    from PIL import Image
+    W, H = size
+    src = img.convert("RGB")
+    # cover-fit the source to the output aspect
+    scale = max(W / src.width, H / src.height) * 1.0
+    src = src.resize((max(W, int(src.width * scale)), max(H, int(src.height * scale))), Image.LANCZOS)
+    frames = []
+    for i in range(n_frames):
+        t = i / max(1, n_frames - 1)
+        e = t * t * (3 - 2 * t)                        # ease in-out
+        z = 1.0 + 0.22 * e
+        cw, ch = src.width / z, src.height / z
+        cx = src.width / 2 + (src.width - cw) * 0.25 * (e - 0.5)
+        cy = src.height / 2 - (src.height - ch) * 0.15 * (e - 0.5)
+        box = (cx - cw / 2, cy - ch / 2, cx + cw / 2, cy + ch / 2)
+        frames.append(src.resize((W, H), Image.LANCZOS, box=box))
+    return frames
+
+
+def save_video(frames: list, fps: int, stem: Path) -> Path:
+    """MP4 when imageio/opencv is available (via diffusers or imageio), else animated GIF."""
+    try:
+        import imageio.v2 as imageio  # needs imageio-ffmpeg for mp4
+        import numpy as np
+        path = stem.with_suffix(".mp4")
+        with imageio.get_writer(path, fps=fps, codec="libx264", quality=8, macro_block_size=8) as w:
+            for f in frames:
+                w.append_data(np.asarray(f))
+        return path
+    except Exception:
+        pass
+    path = stem.with_suffix(".gif")
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=int(1000 / max(1, fps)), loop=0)
+    return path
+
+
+# =============================================================================
+# 7. MCP client (connect Titan to other MCP servers over Streamable HTTP)
+# =============================================================================
+
+class MCPClient:
+    def __init__(self, url: str, headers: Optional[dict] = None):
+        self.url, self.headers = url, dict(headers or {})
+        self.session_id: Optional[str] = None
+        self._id = 0
+        self.ready = False
+
+    def _post(self, payload: dict) -> Optional[dict]:
+        h = {"User-Agent": USER_AGENT, "Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream", **self.headers}
+        if self.session_id:
+            h["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=h, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            sid = r.headers.get("Mcp-Session-Id")
+            if sid:
+                self.session_id = sid
+            ctype = r.headers.get("Content-Type", "")
+            raw = r.read().decode()
+        if "id" not in payload or not raw.strip():
+            return None
+        if "text/event-stream" in ctype:
+            for line in raw.splitlines():
+                if line.startswith("data:"):
+                    msg = json.loads(line[5:].strip())
+                    if msg.get("id") == payload["id"]:
+                        return msg
+            raise RuntimeError("no matching response in event stream")
+        return json.loads(raw)
+
+    def rpc(self, method: str, params: Optional[dict] = None) -> Any:
+        if not self.ready and method != "initialize":
+            self.initialize()
+        self._id += 1
+        msg = self._post({"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}})
+        if msg is None:
+            return None
+        if "error" in msg:
+            raise RuntimeError(f"MCP error: {msg['error']}")
+        return msg.get("result")
+
+    def initialize(self) -> dict:
+        res = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": NAME, "version": __version__}})
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.ready = True
+        return res
+
+    def list_tools(self) -> list[dict]:
+        return (self.rpc("tools/list") or {}).get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        return self.rpc("tools/call", {"name": name, "arguments": arguments}) or {}
+
+
+# =============================================================================
+# 8. The Brain: answer → confidence check → cloud learning → automatic message
+# =============================================================================
+
+HELP = """Commands:
+  /image <prompt>            make an image with your Perchance generator
+  /video <prompt>            make a video (animate); /video:<backend> <prompt> for cogvideox, ltx, wan, modelscope, svd
+  /search <query>            web search (DuckDuckGo + Wikipedia)
+  /teach <question> | <answer>   teach Titan yourself
+  /learn <question>          force a cloud lesson from gpt-oss-120b
+  /tools                     list tools of connected MCP servers
+  /tool <name> <json args>   call an MCP tool
+  /knowledge                 how much Titan knows
+  /status                    model + training status"""
+
+
+class Brain:
+    def __init__(self, cfg: Optional[Config] = None, load: bool = True):
+        self.cfg = cfg or Config.from_env()
+        self.device = pick_device()
+        self.kb = KnowledgeBase(self.cfg.md_path)
+        self.model_lock = threading.Lock()
+        self.trained_steps = 0
+        self.model = Titan(self.cfg.model).to(self.device)
+        if load and self.cfg.ckpt_path.exists():
+            self.load()
+        self.teacher = CloudTeacher(self.cfg)
+        self.images = PerchanceImageGenerator(self.cfg)
+        self.videos = VideoGenerator(self.cfg, self.images)
+        self.mcp = {u: MCPClient(u) for u in self.cfg.mcp_servers}
+        self.trainer = BackgroundTrainer(self)
+        self.report_lock = threading.Lock()
+        if self.trained_steps == 0 and self.cfg.auto_train and self.kb.entries:
+            log(f"no checkpoint yet: bootstrap training on {len(self.kb.entries)} TITAN.md entries in the background")
+            self.trainer.submit("bootstrap")
+
+    # -- persistence -------------------------------------------------------------
+    def save(self) -> None:
+        with self.model_lock:
+            state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+        tmp = self.cfg.ckpt_path.with_suffix(".tmp")
+        torch.save({"version": __version__, "config": asdict(self.cfg.model), "state_dict": state,
+                    "trained_steps": self.trained_steps}, tmp)
+        os.replace(tmp, self.cfg.ckpt_path)
+
+    def load(self) -> None:
+        ck = torch.load(self.cfg.ckpt_path, map_location="cpu", weights_only=True)
+        mc = ModelConfig(**ck["config"])
+        if mc != self.cfg.model:
+            self.cfg.model = mc
+            self.model = Titan(mc).to(self.device)
+        self.model.load_state_dict(ck["state_dict"])
+        self.trained_steps = int(ck.get("trained_steps", 0))
+        log(f"loaded {self.cfg.ckpt_path.name} ({self.trained_steps} training steps)")
+
+    def info(self) -> dict:
+        return {"name": NAME, "version": __version__, "edition": "single-file (titan.py)",
+                "parameters": self.model.num_params(), "config": asdict(self.cfg.model),
+                "device": str(self.device), "trained_steps": self.trained_steps,
+                "knowledge_entries": len(self.kb.entries), "teacher": {"model": self.cfg.teacher_model,
+                                                                        "mode": self.teacher.mode},
+                "image": self.images.status(), "mcp_servers": list(self.mcp), "training": self.trainer.status()}
+
+    # -- core ----------------------------------------------------------------------
+    def think(self, question: str, knowledge: str = "") -> tuple[str, float]:
+        prompt = [BOS] + encode(format_prompt(question, knowledge))
+        with self.model_lock:
+            ids, logps = self.model.generate(prompt, self.cfg.max_new_tokens, self.cfg.temperature, self.cfg.top_k)
+        text = decode(ids).strip()
+        conf = math.exp(sum(logps) / len(logps)) if logps else 0.0
+        return text, conf
+
+    def report(self, rec: dict) -> None:
+        rec = {"time": _dt.datetime.now().isoformat(timespec="seconds"), **rec}
+        with self.report_lock, open(self.cfg.reports_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def reports(self, limit: int = 50) -> list[dict]:
+        if not self.cfg.reports_path.exists():
+            return []
+        lines = self.cfg.reports_path.read_text(encoding="utf-8").splitlines()
+        return [json.loads(x) for x in lines[-limit:] if x.strip()]
+
+    def learn(self, question: str, hits: list[tuple[float, Entry]], draft: str, conf: float, reason: str) -> dict:
+        """The cloud call: ask the teacher, update TITAN.md, train, and write the automatic message."""
+        ctx = [e for _, e in hits]
+        teacher_err = None
+        try:
+            lesson = self.teacher.teach(question, ctx, draft, conf, reason)
+            source = f"cloud:{lesson['model']}"
+            who = f"{lesson['model'].split('/')[-1]} on Cloudflare"
+        except Exception as ex:
+            teacher_err = str(ex)
+            lesson = None
+            if self.cfg.web_fallback:
+                res = web_search(question, limit=1).get("results", [])
+                if res and res[0].get("snippet"):
+                    r0 = res[0]
+                    lesson = {"answer": f"{r0['snippet']} (source: {r0.get('url') or r0['source']})",
+                              "model": r0["source"], "report_id": "", "via": "web"}
+                    source, who = f"web:{r0['source']}", f"the web ({r0['source']})"
+        if lesson is None:
+            self.report({"question": question, "reason": reason, "confidence": round(conf, 4),
+                         "status": "pending", "error": teacher_err})
+            msg = (f"🔔 Automatic report: Titan couldn't elaborate a response (confidence {conf:.2f}, {reason}) "
+                   f"and the cloud teacher is unreachable ({teacher_err}). The question is queued; "
+                   f"run `python titan.py sync` when you're online to learn it.")
+            return {"reply": "I can't answer that yet, and I couldn't reach my teacher. I've queued the question "
+                             "so I can learn it later.", "source": "none", "notices": [msg], "learned": False}
+        entry = self.kb.add(question, lesson["answer"], source)
+        self.trainer.submit("learn", [entry.question])
+        self.report({"question": question, "reason": reason, "confidence": round(conf, 4), "status": "learned",
+                     "teacher": source, "via": lesson["via"], "entry": entry.id,
+                     "cloud_report_id": lesson.get("report_id", ""), "answer_preview": lesson["answer"][:160]})
+        msg = (f"🔔 Automatic report: Titan couldn't elaborate a response (confidence {conf:.2f}, {reason}). "
+               f"Cloud call → learned from {who} → TITAN.md updated (entry #{entry.id}) → "
+               f"training on it in the background.")
+        if teacher_err:
+            msg += f" (Cloud teacher unavailable: {teacher_err}; used the web instead.)"
+        return {"reply": lesson["answer"], "source": source, "notices": [msg], "learned": True, "entry": entry.id}
+
+    def answer(self, question: str, force_cloud: bool = False) -> dict:
+        question = question.strip()
+        hits = self.kb.search(question, k=3)
+        best_score, best = hits[0] if hits else (0.0, None)
+        relevant = best is not None and best_score >= self.cfg.sim_threshold
+        if force_cloud:
+            return {**self.learn(question, hits, "", 0.0, "lesson requested"), "confidence": 0.0}
+        draft, conf = self.think(question, best.answer if relevant else "")
+        too_short = len(draft) < 2
+        if not too_short and conf >= self.cfg.conf_threshold and (relevant or conf >= self.cfg.high_conf):
+            return {"reply": draft, "source": "titan", "confidence": round(conf, 4), "notices": [],
+                    "learned": False, "knowledge": best.id if relevant else None}
+        reason = ("empty answer" if too_short else
+                  "low confidence" if conf < self.cfg.conf_threshold else "nothing about it in TITAN.md")
+        if best is not None and best_score >= self.cfg.recall_threshold:
+            # The answer is already in TITAN.md: no cloud call needed, just recall it and train on it.
+            queued = self.trainer.submit("learn", [best.question])
+            note = (f"🔔 Automatic report: Titan couldn't elaborate a response (confidence {conf:.2f}, {reason}) "
+                    f"but TITAN.md already has it (entry #{best.id}); answered from the file"
+                    + (" and training on it in the background." if queued else "."))
+            return {"reply": best.answer, "source": "knowledge", "confidence": round(conf, 4),
+                    "notices": [note], "learned": False, "knowledge": best.id}
+        return {**self.learn(question, hits, draft, conf, reason), "confidence": round(conf, 4)}
+
+    # -- chat entry point (handles slash commands) ----------------------------------
+    def chat(self, message: str) -> dict:
+        msg = message.strip()
+        if not msg:
+            return {"reply": "Say something!", "source": "titan", "notices": []}
+        if not msg.startswith("/"):
+            return self.answer(msg)
+        cmd, _, arg = msg.partition(" ")
+        arg = arg.strip()
+        cmd = cmd.lower()
+        try:
+            if cmd in ("/help", "/?"):
+                return {"reply": HELP, "source": "command", "notices": []}
+            if cmd == "/status":
+                return {"reply": json.dumps(self.info(), indent=2), "source": "command", "notices": []}
+            if cmd == "/knowledge":
+                return {"reply": f"TITAN.md has {len(self.kb.entries)} entries. Latest: "
+                                 + "; ".join(e.question for e in self.kb.entries[-5:]),
+                        "source": "command", "notices": []}
+            if cmd == "/search":
+                res = web_search(arg)
+                lines = [f"• {r['title']}: {r['snippet'][:300]} {r['url']}" for r in res["results"]]
+                return {"reply": "\n".join(lines) or "No results.", "source": "web", "notices": [], "search": res}
+            if cmd == "/teach":
+                if "|" not in arg:
+                    return {"reply": "Usage: /teach question | answer", "source": "command", "notices": []}
+                q, a = (s.strip() for s in arg.split("|", 1))
+                e = self.kb.add(q, a, "user")
+                self.trainer.submit("learn", [e.question])
+                return {"reply": f"Thanks! Saved as entry #{e.id} in TITAN.md and training on it.",
+                        "source": "command", "notices": [f"🔔 TITAN.md updated by you (entry #{e.id})."]}
+            if cmd == "/learn":
+                return self.answer(arg, force_cloud=True)
+            if cmd == "/image":
+                r = self.images.generate(arg)
+                return {"reply": r.get("message") or f"Here's your image ({Path(r['file']).name}).",
+                        "source": "perchance", "notices": [], "image": r}
+            if cmd.startswith("/video"):
+                backend = cmd.split(":", 1)[1] if ":" in cmd else "animate"
+                r = self.videos.generate(arg, backend=backend)
+                return {"reply": f"Video ready ({backend}): {Path(r['file']).name}", "source": backend,
+                        "notices": r["notes"], "video": r}
+            if cmd == "/tools":
+                lines = []
+                for url, cli in self.mcp.items():
+                    for t in cli.list_tools():
+                        lines.append(f"• {t['name']} ({url}): {t.get('description', '')[:120]}")
+                return {"reply": "\n".join(lines) or "No MCP servers connected (set TITAN_MCP_SERVERS).",
+                        "source": "mcp", "notices": []}
+            if cmd == "/tool":
+                name, _, js = arg.partition(" ")
+                args = json.loads(js) if js.strip() else {}
+                for url, cli in self.mcp.items():
+                    if any(t["name"] == name for t in cli.list_tools()):
+                        res = cli.call_tool(name, args)
+                        text = "\n".join(c.get("text", f"[{c.get('type')}]") for c in res.get("content", []))
+                        return {"reply": text or json.dumps(res), "source": f"mcp:{url}", "notices": []}
+                return {"reply": f"No connected MCP server has a tool named {name!r}.", "source": "mcp", "notices": []}
+        except Exception as ex:
+            return {"reply": f"⚠️ {cmd} failed: {ex}", "source": "error", "notices": []}
+        return {"reply": f"Unknown command {cmd}. Type /help.", "source": "command", "notices": []}
+
+    def process_pending(self) -> list[dict]:
+        """Retry questions that were queued while the cloud was unreachable."""
+        done = []
+        learned = {r["question"] for r in self.reports(10_000) if r.get("status") == "learned"}
+        pending = [r for r in self.reports(10_000) if r.get("status") == "pending" and r["question"] not in learned]
+        for q in dict.fromkeys(r["question"] for r in pending):
+            done.append(self.learn(q, self.kb.search(q), "", 0.0, "queued while offline"))
+        return done
+
+
+# =============================================================================
+# 9. MCP server (stdio + HTTP /mcp)
+# =============================================================================
+
+MCP_TOOLS = [
+    {"name": "titan_chat", "description": "Chat with Titan-23M. It answers from its own model and TITAN.md, "
+                                          "and learns from gpt-oss-120b when it can't.",
+     "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
+    {"name": "titan_generate_image", "description": "Generate an image with Titan's Perchance generator.",
+     "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"},
+                                                      "negative_prompt": {"type": "string"}}, "required": ["prompt"]}},
+    {"name": "titan_generate_video", "description": "Generate a video on this device. Backends: "
+                                                    + ", ".join(VIDEO_BACKENDS),
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "backend": {"type": "string", "enum": list(VIDEO_BACKENDS)},
+         "frames": {"type": "integer"}, "image_base64": {"type": "string"}}, "required": ["prompt"]}},
+    {"name": "titan_web_search", "description": "Search the web (DuckDuckGo instant answers + Wikipedia).",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "titan_teach", "description": "Teach Titan a question/answer pair (saved to TITAN.md, then trained).",
+     "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}, "answer": {"type": "string"}},
+                     "required": ["question", "answer"]}},
+    {"name": "titan_knowledge", "description": "Read Titan's TITAN.md knowledge file, or search it.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+]
+
+
+def mcp_call_tool(brain: Brain, name: str, a: dict) -> dict:
+    def text(t: str) -> dict:
+        return {"content": [{"type": "text", "text": t}]}
+
+    if name == "titan_chat":
+        r = brain.chat(a.get("message", ""))
+        return text("\n".join([r["reply"], *r.get("notices", [])]))
+    if name == "titan_generate_image":
+        r = brain.images.generate(a["prompt"], a.get("negative_prompt", ""))
+        if r.get("ok"):
+            data = Path(r["file"]).read_bytes()
+            mime = mimetypes.guess_type(r["file"])[0] or "image/png"
+            return {"content": [{"type": "image", "data": base64.b64encode(data).decode(), "mimeType": mime},
+                                {"type": "text", "text": f"Saved to {r['file']}"}]}
+        return text(json.dumps(r))
+    if name == "titan_generate_video":
+        img = base64.b64decode(a["image_base64"]) if a.get("image_base64") else None
+        r = brain.videos.generate(a["prompt"], a.get("backend", "animate"), img, a.get("frames"))
+        return text(json.dumps(r))
+    if name == "titan_web_search":
+        return text(json.dumps(web_search(a["query"]), ensure_ascii=False, indent=1))
+    if name == "titan_teach":
+        e = brain.kb.add(a["question"], a["answer"], "user")
+        brain.trainer.submit("learn", [e.question])
+        return text(f"Saved as entry #{e.id} in TITAN.md; training started.")
+    if name == "titan_knowledge":
+        if a.get("query"):
+            return text("\n".join(e.to_md() for _, e in brain.kb.search(a["query"], 5)) or "Nothing found.")
+        return text(brain.kb.text)
+    raise KeyError(name)
+
+
+def mcp_handle(brain: Brain, msg: dict) -> Optional[dict]:
+    mid, method = msg.get("id"), msg.get("method", "")
+    if mid is None:  # notification
+        return None
+    try:
+        if method == "initialize":
+            pv = (msg.get("params") or {}).get("protocolVersion") or "2025-06-18"
+            result = {"protocolVersion": pv, "capabilities": {"tools": {"listChanged": False}},
+                      "serverInfo": {"name": NAME, "version": __version__},
+                      "instructions": "Titan-23M: chat, images (Perchance), on-device video, web search, teaching."}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": MCP_TOOLS}
+        elif method == "tools/call":
+            p = msg.get("params") or {}
+            try:
+                result = mcp_call_tool(brain, p.get("name", ""), p.get("arguments") or {})
+            except KeyError as ex:
+                return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"unknown tool or argument {ex}"}}
+            except Exception as ex:
+                result = {"content": [{"type": "text", "text": f"error: {ex}"}], "isError": True}
+        else:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}}
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+    except Exception as ex:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(ex)}}
+
+
+def run_mcp_stdio(brain: Brain) -> None:
+    log("MCP server on stdio ready")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            out = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            if isinstance(msg, list):
+                out = [r for r in (mcp_handle(brain, m) for m in msg) if r] or None
+            else:
+                out = mcp_handle(brain, msg)
+        if out:
+            sys.stdout.write(json.dumps(out) + "\n")
+            sys.stdout.flush()
+
+
+# =============================================================================
+# 10. HTTP API + browser UI
+# =============================================================================
+
+UI_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Titan-23M</title>
+<style>
+:root{--bg:#f6f7fb;--panel:#fff;--ink:#141826;--muted:#5d6475;--line:#e3e6ee;--accent:#4f46e5;--accent-ink:#fff;
+--me:#4f46e5;--me-ink:#fff;--bot:#eef0f6;--note:#fff6db;--note-ink:#6b4e00;--err:#b42318}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;
+--muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;--accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;
+--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80}}
+:root[data-theme="dark"]{--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;--muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;
+--accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80}
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.app{max-width:900px;margin:0 auto;padding:16px;display:flex;flex-direction:column;height:100%}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+h1{font-size:20px;margin:0}h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
+.status{font-size:12px;color:var(--muted);margin-left:auto}
+nav{display:flex;gap:4px;margin:12px 0;border-bottom:1px solid var(--line);overflow-x:auto}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:8px 12px;font:inherit;cursor:pointer}
+nav button.on{color:var(--ink);border-color:var(--accent)}
+section{display:none;flex:1;min-height:0;flex-direction:column;gap:10px}section.on{display:flex}
+#log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:4px 2px}
+.msg{max-width:85%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+.me{align-self:flex-end;background:var(--me);color:var(--me-ink);border-bottom-right-radius:4px}
+.bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:4px}
+.note{align-self:center;background:var(--note);color:var(--note-ink);font-size:13px;max-width:95%;border-radius:8px}
+.meta{display:block;font-size:11px;color:var(--muted);margin-top:4px}
+.msg img,.msg video,.out img,.out video{max-width:100%;border-radius:8px;margin-top:6px;display:block}
+form.row{display:flex;gap:8px}
+input,textarea,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 11px;min-width:0}
+textarea{resize:vertical}input:focus,textarea:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.row input{flex:1}
+button.go{background:var(--accent);color:var(--accent-ink);border:0;border-radius:10px;padding:9px 16px;font:inherit;font-weight:600;cursor:pointer}
+button.go:disabled{opacity:.5;cursor:wait}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}@media(max-width:560px){.grid{grid-template-columns:1fr}}
+label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+.hint{font-size:13px;color:var(--muted)}.err{color:var(--err)}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;flex:1;margin:0;font-size:13px}
+iframe{width:100%;height:520px;border:1px solid var(--line);border-radius:10px;background:#fff}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+  <h1>Titan-23M <small id="edition"></small></h1>
+  <span class="status" id="status">connecting…</span>
+</header>
+<nav>
+  <button class="on" data-tab="chat">Chat</button><button data-tab="image">Image</button>
+  <button data-tab="video">Video</button><button data-tab="knowledge">Knowledge</button><button data-tab="settings">Settings</button>
+</nav>
+
+<section id="chat" class="on">
+  <div id="log"></div>
+  <form class="row" id="chatForm"><input id="chatIn" autocomplete="off" placeholder="Ask Titan… (/help for commands)"><button class="go">Send</button></form>
+</section>
+
+<section id="image">
+  <div class="card">
+    <label>Prompt<textarea id="imgPrompt" rows="3" placeholder="a lighthouse on a cliff at sunset, oil painting"></textarea></label>
+    <label>Negative prompt<input id="imgNeg" placeholder="blurry, low quality"></label>
+    <div><button class="go" id="imgGo">Generate with Perchance</button></div>
+    <div class="hint" id="imgHint">Images come from your Perchance generator.</div>
+  </div>
+  <div class="out" id="imgOut"></div>
+</section>
+
+<section id="video">
+  <div class="card">
+    <label>Prompt<textarea id="vidPrompt" rows="2" placeholder="a paper boat drifting on a rainy street"></textarea></label>
+    <div class="grid">
+      <label>Generator<select id="vidBackend"></select></label>
+      <label>Frames (blank = default)<input id="vidFrames" type="number" min="8" max="200"></label>
+    </div>
+    <label>Image to animate (optional)<input id="vidImage" type="file" accept="image/*"></label>
+    <div><button class="go" id="vidGo">Generate video</button></div>
+    <div class="hint" id="vidHint"></div>
+  </div>
+  <div class="out" id="vidOut"></div>
+</section>
+
+<section id="knowledge">
+  <div class="card">
+    <div class="grid"><input id="tQ" placeholder="Question"><input id="tA" placeholder="Answer"></div>
+    <div><button class="go" id="teachGo">Teach Titan</button> <span class="hint" id="teachHint"></span></div>
+  </div>
+  <pre id="md">loading TITAN.md…</pre>
+</section>
+
+<section id="settings">
+  <div class="card">
+    <label>API key (only if the server requires one)<input id="key" type="password" autocomplete="off"></label>
+    <label>Theme<select id="theme"><option value="">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+    <div class="hint">API: <code>POST /v1/chat</code>, <code>/v1/chat/completions</code>, <code>/v1/image</code>, <code>/v1/video</code>, <code>/v1/teach</code>, <code>GET /v1/knowledge</code>, <code>/v1/search?q=</code>, MCP at <code>/mcp</code>.</div>
+  </div>
+</section>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const store = {get(k){try{return localStorage.getItem(k)||""}catch(e){return ""}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function headers(json=true){const h={}; if(json)h["Content-Type"]="application/json"; const k=store.get("titanKey"); if(k)h["Authorization"]="Bearer "+k; return h;}
+async function api(path, body){
+  const r = await fetch(path, body===undefined?{headers:headers(false)}:{method:"POST",headers:headers(),body:JSON.stringify(body)});
+  const ct = r.headers.get("content-type")||"";
+  const data = ct.includes("json") ? await r.json() : await r.text();
+  if(!r.ok) throw new Error((data&&data.error)||data||r.statusText);
+  return data;
+}
+// tabs + settings
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("nav button,section").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); $("#"+b.dataset.tab).classList.add("on");
+  if(b.dataset.tab==="knowledge") loadMd();
+});
+$("#key").value=store.get("titanKey"); $("#key").onchange=e=>store.set("titanKey",e.target.value);
+$("#theme").value=store.get("titanTheme"); applyTheme();
+$("#theme").onchange=e=>{store.set("titanTheme",e.target.value);applyTheme()};
+function applyTheme(){const t=store.get("titanTheme"); if(t)document.documentElement.dataset.theme=t; else delete document.documentElement.dataset.theme;}
+
+let EDITION="";
+api("/v1/health").then(h=>{
+  EDITION=h.edition||""; $("#edition").textContent=EDITION;
+  $("#status").textContent=[h.parameters?(h.parameters/1e6).toFixed(1)+"M params":"", h.knowledge_entries+" facts",
+    "teacher: "+(h.teacher||"gpt-oss-120b")].filter(Boolean).join(" · ");
+}).catch(e=>$("#status").textContent="offline: "+e.message);
+
+// chat
+function add(cls, html, meta){const d=document.createElement("div"); d.className="msg "+cls; d.innerHTML=html+(meta?`<span class="meta">${esc(meta)}</span>`:""); $("#log").appendChild(d); $("#log").scrollTop=1e9; return d;}
+function media(r){
+  let h="";
+  const img=r.image, vid=r.video;
+  if(img&&img.image_url) h+=`<img src="${esc(img.image_url)}" alt="">`;
+  else if(img&&img.url) h+=`<br><a href="${esc(img.url)}" target="_blank" rel="noopener">Open your Perchance generator</a>`;
+  if(vid&&vid.video_url) h+=vid.video_url.endsWith(".gif")?`<img src="${esc(vid.video_url)}" alt="">`:`<video src="${esc(vid.video_url)}" controls autoplay loop muted playsinline></video>`;
+  return h;
+}
+add("bot","Hi, I'm Titan. Ask me anything. When I don't know, my teacher gpt-oss-120b on Cloudflare teaches me and I write it into TITAN.md. Type /help for commands.");
+$("#chatForm").onsubmit=async e=>{
+  e.preventDefault(); const m=$("#chatIn").value.trim(); if(!m)return; $("#chatIn").value="";
+  add("me",esc(m)); const wait=add("bot","…");
+  try{
+    const r=await api("/v1/chat",{message:m});
+    const conf = typeof r.confidence==="number" ? ` · confidence ${r.confidence.toFixed(2)}` : "";
+    wait.innerHTML=esc(r.reply)+media(r)+`<span class="meta">${esc(r.source||"")}${conf}</span>`;
+    (r.notices||[]).forEach(n=>add("note",esc(n)));
+  }catch(err){wait.innerHTML=`<span class="err">${esc(err.message)}</span>`}
+};
+
+// image
+$("#imgGo").onclick=async()=>{
+  const p=$("#imgPrompt").value.trim(); if(!p)return; const b=$("#imgGo"); b.disabled=true; $("#imgHint").textContent="Generating… (this can take a minute)";
+  try{
+    const r=await api("/v1/image",{prompt:p,negative_prompt:$("#imgNeg").value});
+    if(r.image_url){$("#imgOut").innerHTML=`<img src="${esc(r.image_url)}" alt="${esc(p)}"><p class="hint"><a href="${esc(r.image_url)}" download>Download</a></p>`;$("#imgHint").textContent="Done.";}
+    else if(r.url){$("#imgHint").innerHTML=esc(r.message||"")+` <a href="${esc(r.url)}" target="_blank" rel="noopener">Open in a new tab</a>`;
+      $("#imgOut").innerHTML=`<p class="hint">Prompt to paste: <b>${esc(p)}</b></p><iframe src="${esc(r.url)}" title="Perchance generator"></iframe>`;}
+    else $("#imgHint").textContent=r.message||"No image.";
+  }catch(err){$("#imgHint").innerHTML=`<span class="err">${esc(err.message)}</span>`} finally{b.disabled=false}
+};
+
+// video
+let BACKENDS=[];
+api("/v1/video/backends").then(r=>{
+  BACKENDS=r.backends||[];
+  $("#vidBackend").innerHTML=`<option value="browser">animate — in this browser (works online)</option>`+
+    BACKENDS.map(b=>`<option value="${esc(b.name)}" ${b.available?"":"disabled"}>${esc(b.name)} — ${esc(b.where)}${b.available?"":" (not installed)"}</option>`).join("");
+  showVidHint();
+}).catch(()=>{$("#vidBackend").innerHTML=`<option value="browser">animate — in this browser (works online)</option>`; showVidHint();});
+$("#vidBackend").onchange=showVidHint;
+function showVidHint(){const v=$("#vidBackend").value; const b=BACKENDS.find(x=>x.name===v);
+  $("#vidHint").textContent = v==="browser" ? "Runs right here: animates your image (or a title card) into a WebM clip." : (b? b.description+(b.warning?" ⚠ "+b.warning:"") : "");}
+function readFile(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(f);});}
+$("#vidGo").onclick=async()=>{
+  const p=$("#vidPrompt").value.trim(), be=$("#vidBackend").value, f=$("#vidImage").files[0], btn=$("#vidGo");
+  btn.disabled=true; $("#vidHint").textContent="Generating… heavy generators can take minutes.";
+  try{
+    const dataUrl = f ? await readFile(f) : null;
+    if(be==="browser"){ const url=await browserAnimate(dataUrl,p,+$("#vidFrames").value||72);
+      $("#vidOut").innerHTML=`<video src="${url}" controls autoplay loop muted playsinline></video><p class="hint"><a href="${url}" download="titan-animate.webm">Download</a></p>`; $("#vidHint").textContent="Done.";}
+    else{ const r=await api("/v1/video",{prompt:p,backend:be,frames:+$("#vidFrames").value||null,image_base64:dataUrl?dataUrl.split(",")[1]:null});
+      const u=r.video_url; $("#vidOut").innerHTML=(u.endsWith(".gif")?`<img src="${esc(u)}" alt="">`:`<video src="${esc(u)}" controls autoplay loop muted playsinline></video>`)+`<p class="hint"><a href="${esc(u)}" download>Download</a> ${esc((r.notes||[]).join(" "))}</p>`; $("#vidHint").textContent="Done.";}
+  }catch(err){$("#vidHint").innerHTML=`<span class="err">${esc(err.message)}</span>`} finally{btn.disabled=false}
+};
+async function browserAnimate(dataUrl, prompt, frames){
+  const W=768,H=432,fps=24,c=document.createElement("canvas"); c.width=W; c.height=H; const g=c.getContext("2d");
+  let img=null;
+  if(dataUrl){img=new Image(); img.src=dataUrl; await img.decode();}
+  const draw=t=>{const e=t*t*(3-2*t), z=1+0.22*e;
+    if(img){const s=Math.max(W/img.width,H/img.height)*z, w=img.width*s, h=img.height*s;
+      g.drawImage(img,(W-w)/2+(w-W)*0.25*(e-0.5),(H-h)/2-(h-H)*0.15*(e-0.5),w,h);}
+    else{const gr=g.createLinearGradient(0,0,0,H); gr.addColorStop(0,"#141a3c"); gr.addColorStop(1,"#3c4ab4"); g.fillStyle=gr; g.fillRect(0,0,W,H);
+      g.save(); g.translate(W/2,H/2); g.scale(z,z); g.fillStyle="#f0f0ff"; g.font="600 28px system-ui"; g.textAlign="center";
+      const words=(prompt||"Titan-23M").split(" "); let line="",lines=[]; for(const w of words){if((line+" "+w).length>34){lines.push(line);line=w}else line=(line+" "+w).trim()} lines.push(line);
+      lines.slice(0,5).forEach((l,i)=>g.fillText(l,0,(i-(Math.min(lines.length,5)-1)/2)*36)); g.restore();}};
+  draw(0);
+  const stream=c.captureStream(fps), rec=new MediaRecorder(stream,{mimeType:MediaRecorder.isTypeSupported("video/webm;codecs=vp9")?"video/webm;codecs=vp9":"video/webm"});
+  const chunks=[]; rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  const done=new Promise(r=>rec.onstop=r); rec.start();
+  for(let i=0;i<frames;i++){draw(i/(frames-1)); await new Promise(r=>setTimeout(r,1000/fps));}
+  rec.stop(); await done; return URL.createObjectURL(new Blob(chunks,{type:"video/webm"}));
+}
+
+// knowledge
+async function loadMd(){try{$("#md").textContent=await api("/v1/knowledge")}catch(e){$("#md").textContent=e.message}}
+$("#teachGo").onclick=async()=>{const q=$("#tQ").value.trim(),a=$("#tA").value.trim(); if(!q||!a)return;
+  try{const r=await api("/v1/teach",{question:q,answer:a}); $("#teachHint").textContent=r.message||"Saved."; $("#tQ").value=$("#tA").value=""; loadMd();}
+  catch(e){$("#teachHint").innerHTML=`<span class="err">${esc(e.message)}</span>`}};
+</script>
+</body>
+</html>
+"""
+
+
+class TitanHTTP(BaseHTTPRequestHandler):
+    brain: Brain  # set by serve()
+    server_version = f"Titan/{__version__}"
+
+    def log_message(self, fmt, *args):
+        log("http", self.address_string(), fmt % args)
+
+    # -- helpers ---------------------------------------------------------------
+    def _send(self, code: int, body: bytes, ctype: str, extra: Optional[dict] = None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the client went away
+
+    def _json(self, obj: Any, code: int = 200, extra: Optional[dict] = None):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8", extra)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 50 * 1024 * 1024:
+            raise ValueError("request too large")
+        raw = self.rfile.read(n) if n else b"{}"
+        return json.loads(raw or b"{}")
+
+    def _authorized(self) -> bool:
+        key = self.brain.cfg.local_key
+        if not key:
+            return True
+        return self.headers.get("Authorization", "") == f"Bearer {key}"
+
+    def _file_url(self, path: str) -> str:
+        return "/outputs/" + urllib.parse.quote(Path(path).name)
+
+    def do_OPTIONS(self):
+        self._send(204, b"", "text/plain")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    # -- routes ----------------------------------------------------------------
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        p, qs = u.path, urllib.parse.parse_qs(u.query)
+        b = self.brain
+        try:
+            if p in ("/", "/index.html"):
+                return self._send(200, UI_HTML.encode(), "text/html; charset=utf-8")
+            if p.startswith("/outputs/"):
+                f = b.cfg.out_dir / Path(urllib.parse.unquote(p[len("/outputs/"):])).name
+                if not f.is_file():
+                    return self._json({"error": "not found"}, 404)
+                return self._send(200, f.read_bytes(), mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+            if p == "/v1/health":
+                return self._json({"ok": True, "name": NAME, "version": __version__, "edition": "titan.py",
+                                   "parameters": b.model.num_params(), "knowledge_entries": len(b.kb.entries),
+                                   "teacher": b.cfg.teacher_model.split("/")[-1], "teacher_mode": b.teacher.mode,
+                                   "training": b.trainer.status()})
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
+            if p == "/v1/model":
+                return self._json(b.info())
+            if p == "/v1/knowledge":
+                return self._send(200, b.kb.text.encode(), "text/markdown; charset=utf-8")
+            if p == "/v1/knowledge/entries":
+                q = (qs.get("q") or [""])[0]
+                ents = [e for _, e in b.kb.search(q, 10)] if q else b.kb.entries
+                return self._json({"entries": [asdict(e) for e in ents]})
+            if p == "/v1/search":
+                return self._json(web_search((qs.get("q") or [""])[0]))
+            if p == "/v1/video/backends":
+                return self._json({"backends": b.videos.backends()})
+            if p == "/v1/image/status":
+                return self._json(b.images.status())
+            if p == "/v1/reports":
+                return self._json({"reports": b.reports()})
+            if p == "/mcp":
+                return self._json({"error": "use POST for MCP JSON-RPC"}, 405, {"Allow": "POST"})
+            return self._json({"error": "not found"}, 404)
+        except Exception as ex:
+            log(traceback.format_exc())
+            return self._json({"error": str(ex)}, 500)
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path).path
+        b = self.brain
+        if not self._authorized():
+            return self._json({"error": "unauthorized"}, 401)
+        try:
+            body = self._body()
+            if p == "/v1/chat":
+                r = b.chat(str(body.get("message", "")))
+                for k in ("image", "video"):
+                    if r.get(k) and r[k].get("file"):
+                        r[k][k + "_url"] = self._file_url(r[k]["file"])
+                return self._json(r)
+            if p == "/v1/chat/completions":  # OpenAI-compatible
+                msgs = body.get("messages") or []
+                last = next((m for m in reversed(msgs) if m.get("role") == "user"), {"content": ""})
+                content = last.get("content")
+                if isinstance(content, list):
+                    content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                r = b.chat(str(content))
+                return self._json({
+                    "id": "chatcmpl-" + uuid.uuid4().hex[:12], "object": "chat.completion", "created": int(time.time()),
+                    "model": "titan-23m", "choices": [{"index": 0, "finish_reason": "stop",
+                                                       "message": {"role": "assistant", "content": r["reply"]}}],
+                    "usage": {"prompt_tokens": len(encode(str(content))), "completion_tokens": len(encode(r["reply"])),
+                              "total_tokens": len(encode(str(content))) + len(encode(r["reply"]))},
+                    "titan": {k: v for k, v in r.items() if k != "reply"}})
+            if p == "/v1/learn":
+                return self._json(b.answer(str(body.get("question", "")), force_cloud=True))
+            if p == "/v1/teach":
+                q, a = str(body.get("question", "")).strip(), str(body.get("answer", "")).strip()
+                if not q or not a:
+                    return self._json({"error": "question and answer are required"}, 400)
+                e = b.kb.add(q, a, body.get("source") or "user")
+                b.trainer.submit("learn", [e.question])
+                return self._json({"ok": True, "entry": asdict(e), "message": f"Saved as entry #{e.id}; training started."})
+            if p == "/v1/knowledge":  # merge another TITAN.md (e.g. from the cloud)
+                n = b.kb.merge_markdown(str(body.get("markdown", "")))
+                return self._json({"ok": True, "added": n, "entries": len(b.kb.entries)})
+            if p == "/v1/image":
+                r = b.images.generate(str(body.get("prompt", "")), str(body.get("negative_prompt", "")))
+                if r.get("file"):
+                    r["image_url"] = self._file_url(r["file"])
+                return self._json(r)
+            if p == "/v1/video":
+                img = base64.b64decode(body["image_base64"]) if body.get("image_base64") else None
+                r = b.videos.generate(str(body.get("prompt", "")), body.get("backend") or "animate", img,
+                                      body.get("frames"), int(body.get("fps") or 0) or 12, body.get("steps"),
+                                      body.get("seed"), str(body.get("negative_prompt", "")))
+                r["video_url"] = self._file_url(r["file"])
+                return self._json(r)
+            if p == "/v1/train":
+                ok = b.trainer.submit("bootstrap", steps=int(body.get("steps") or b.cfg.bootstrap_steps))
+                return self._json({"ok": ok, "training": b.trainer.status()})
+            if p == "/mcp":
+                if isinstance(body, list):
+                    out = [r for r in (mcp_handle(b, m) for m in body) if r]
+                else:
+                    out = mcp_handle(b, body)
+                if not out:
+                    return self._send(202, b"", "text/plain")
+                sid = self.headers.get("Mcp-Session-Id") or uuid.uuid4().hex
+                return self._json(out, extra={"Mcp-Session-Id": sid})
+            return self._json({"error": "not found"}, 404)
+        except ValueError as ex:
+            return self._json({"error": str(ex)}, 400)
+        except Exception as ex:
+            log(traceback.format_exc())
+            return self._json({"error": str(ex)}, 500)
+
+
+def make_server(brain: Brain, host: str = "127.0.0.1", port: int = 8023) -> ThreadingHTTPServer:
+    handler = type("Handler", (TitanHTTP,), {"brain": brain})
+    srv = ThreadingHTTPServer((host, port), handler)
+    srv.daemon_threads = True
+    return srv
+
+
+# =============================================================================
+# 11. CLI
+# =============================================================================
+
+def cmd_sync(brain: Brain) -> None:
+    cfg = brain.cfg
+    if not cfg.cloud_url:
+        log("TITAN_CLOUD_URL isn't set; only retrying queued questions")
+    else:
+        h = {"Authorization": f"Bearer {cfg.cloud_key}"} if cfg.cloud_key else {}
+        req = urllib.request.Request(cfg.cloud_url + "/v1/knowledge", headers={"User-Agent": USER_AGENT, **h})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            cloud_md = r.read().decode()
+        n = brain.kb.merge_markdown(cloud_md)
+        log(f"pulled {n} new entries from the cloud")
+        r = http_json(cfg.cloud_url + "/v1/knowledge", {"markdown": brain.kb.text}, headers=h)
+        log(f"pushed TITAN.md to the cloud: {r}")
+        if n:
+            brain.trainer.submit("bootstrap", steps=max(50, 10 * n))
+    for res in brain.process_pending():
+        print(res["notices"][0] if res.get("notices") else res)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    ap = argparse.ArgumentParser(prog="titan.py", description=f"{NAME}: single-file AI (PyTorch).")
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("serve", help="HTTP API + browser UI")
+    s.add_argument("--host", default=os.environ.get("TITAN_HOST", "127.0.0.1"))
+    s.add_argument("--port", type=int, default=int(os.environ.get("TITAN_PORT", "8023")))
+    sub.add_parser("chat", help="chat in the terminal")
+    a = sub.add_parser("ask", help="ask one question")
+    a.add_argument("question", nargs="+")
+    t = sub.add_parser("train", help="train on TITAN.md")
+    t.add_argument("--steps", type=int, default=None)
+    t.add_argument("--lr", type=float, default=None)
+    sub.add_parser("mcp", help="MCP server over stdio")
+    i = sub.add_parser("image", help="generate an image with your Perchance generator")
+    i.add_argument("prompt", nargs="+")
+    v = sub.add_parser("video", help="generate a video on this device")
+    v.add_argument("prompt", nargs="+")
+    v.add_argument("--backend", default="animate", choices=list(VIDEO_BACKENDS))
+    v.add_argument("--image", help="image file to animate")
+    v.add_argument("--frames", type=int)
+    sub.add_parser("sync", help="sync TITAN.md with the cloud and learn queued questions")
+    sub.add_parser("info", help="model size and status")
+    args = ap.parse_args(argv)
+    cmd = args.cmd or "chat"
+
+    cfg = Config.from_env()
+    if cmd in ("train", "info", "image", "video", "mcp", "ask", "sync"):
+        cfg.auto_train = False  # these commands shouldn't spawn background bootstrap training
+    brain = Brain(cfg)
+
+    if cmd == "info":
+        print(json.dumps(brain.info(), indent=2))
+    elif cmd == "train":
+        steps = args.steps or cfg.bootstrap_steps
+        print(f"training {brain.model.num_params()/1e6:.2f}M params on {len(brain.kb.entries)} entries, "
+              f"{steps} steps on {brain.device}")
+        t0 = time.time()
+
+        def on_step(i, loss):
+            if i % 10 == 0 or i == steps - 1:
+                print(f"  step {i+1:5d}/{steps}  loss {loss:.4f}  ({time.time()-t0:.0f}s)", flush=True)
+
+        train_steps(brain.model, brain.kb.entries, steps, args.lr or cfg.lr, cfg.batch_size, on_step=on_step)
+        brain.trained_steps += steps
+        brain.save()
+        print(f"saved {cfg.ckpt_path}")
+    elif cmd == "serve":
+        srv = make_server(brain, args.host, args.port)
+        print(f"Titan-23M is listening on http://{args.host}:{args.port}  (UI at /, API at /v1, MCP at /mcp)")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    elif cmd == "mcp":
+        run_mcp_stdio(brain)
+    elif cmd == "ask":
+        r = brain.chat(" ".join(args.question))
+        print(r["reply"])
+        for n in r.get("notices", []):
+            print(n)
+    elif cmd == "image":
+        print(json.dumps(brain.images.generate(" ".join(args.prompt)), indent=2))
+    elif cmd == "video":
+        img = Path(args.image).read_bytes() if args.image else None
+        print(json.dumps(brain.videos.generate(" ".join(args.prompt), args.backend, img, args.frames), indent=2))
+    elif cmd == "sync":
+        cmd_sync(brain)
+    else:  # chat
+        print(f"{NAME} — {brain.model.num_params()/1e6:.1f}M params, {len(brain.kb.entries)} facts. /help for commands, Ctrl+C to quit.")
+        try:
+            while True:
+                msg = input("you> ")
+                r = brain.chat(msg)
+                print("titan>", r["reply"])
+                for n in r.get("notices", []):
+                    print("     ", n)
+        except (KeyboardInterrupt, EOFError):
+            print()
+
+
+if __name__ == "__main__":
+    main()

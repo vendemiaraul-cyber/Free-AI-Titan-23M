@@ -1,0 +1,24 @@
+# Free-AI-Titan-23M — Cloudflare edition
+# 1) npx wrangler kv namespace create KNOWLEDGE   -> paste the id below
+# 2) npx wrangler deploy
+# Optional secrets:
+#   npx wrangler secret put TITAN_API_KEY        # protects /v1/teach, /v1/knowledge (POST), /mcp, ...
+#   npx wrangler secret put REPORT_WEBHOOK_URL   # Discord/Slack webhook for the automatic reports
+name = "free-ai-titan-23m"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "KNOWLEDGE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[vars]
+TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
+# Your generator on perchance.org, e.g. "https://perchance.org/my-titan-images"
+PERCHANCE_URL = ""
+# Let anyone chat in the browser even when TITAN_API_KEY is set ("false" to require the key)
+PUBLIC_CHAT = "true"
+RECALL_THRESHOLD = "0.55"

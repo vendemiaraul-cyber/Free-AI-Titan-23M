@@ -1,0 +1,32 @@
+==================== LISTS PANEL (left side) ====================
+
+title = Titan-23M Image Generator
+
+image = {import:text-to-image-plugin}
+
+style
+  photorealistic, highly detailed, sharp focus
+  digital painting, vibrant colors, artstation
+  anime style, clean lines, soft shading
+  watercolor illustration, soft paper texture
+  cinematic still, dramatic lighting, 35mm film
+
+==================== HTML PANEL (right side) ====================
+
+<h1>[title]</h1>
+
+<p><textarea id="prompt" rows="3" style="width:95%;max-width:640px" placeholder="Describe your image"></textarea></p>
+<p><input id="negative" style="width:95%;max-width:640px" placeholder="Negative prompt (optional)"></p>
+<p>
+  <select id="styleSel">
+    <option value="">No style</option>
+    <option>photorealistic, highly detailed, sharp focus</option>
+    <option>digital painting, vibrant colors, artstation</option>
+    <option>anime style, clean lines, soft shading</option>
+    <option>watercolor illustration, soft paper texture</option>
+    <option>cinematic still, dramatic lighting, 35mm film</option>
+  </select>
+  <button id="generateBtn" onclick="update(output)">Generate</button>
+</p>
+
+<div id="output">[prompt.value ? image({prompt: prompt.value + (styleSel.value ? ", " + styleSel.value : ""), negativePrompt: negative.value, resolution: "768x768"}) : ""]</div>

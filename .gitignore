@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+titan.pt
+titan.tmp
+titan_reports.jsonl
+outputs/
+node_modules/
+cloudflare/.wrangler/
+.dev.vars

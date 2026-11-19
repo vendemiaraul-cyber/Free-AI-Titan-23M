@@ -1,0 +1,14 @@
+# Core (the AI itself)
+torch>=2.1
+pillow>=10.0
+
+# Optional: let titan.py drive your Perchance generator headlessly (then: playwright install chromium)
+# playwright>=1.45
+
+# Optional: on-device video generators (CogVideoX, LTX-Video, Wan 2.1, ModelScope, SVD) + mp4 export
+# diffusers>=0.33
+# transformers>=4.44
+# accelerate>=0.33
+# sentencepiece
+# imageio>=2.34
+# imageio-ffmpeg>=0.5
