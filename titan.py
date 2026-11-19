@@ -1457,24 +1457,36 @@ UI_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Titan-23M</title>
+<meta name="description" content="Titan-23M: a free 23M-parameter PyTorch AI that learns what it doesn't know. Downloadable, or talk to it in the browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#f6f7fb;--panel:#fff;--ink:#141826;--muted:#5d6475;--line:#e3e6ee;--accent:#4f46e5;--accent-ink:#fff;
---me:#4f46e5;--me-ink:#fff;--bot:#eef0f6;--note:#fff6db;--note-ink:#6b4e00;--err:#b42318}
+--me:#4f46e5;--me-ink:#fff;--bot:#eef0f6;--note:#fff6db;--note-ink:#6b4e00;--err:#b42318;
+--grad-a:#4f46e5;--grad-b:#0891b2;--glow-a:rgba(79,70,229,.18);--glow-b:rgba(8,145,178,.14);--chip:#eceefe;--code:#0f1220;--code-ink:#dfe3f5}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;
 --muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;--accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;
---note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80}}
+--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80;
+--grad-a:#a5b4fc;--grad-b:#67e8f9;--glow-a:rgba(99,102,241,.28);--glow-b:rgba(34,211,238,.16);--chip:#1f2333;--code:#0b0d14;--code-ink:#dfe3f5}}
 :root[data-theme="dark"]{--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;--muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;
---accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80}
+--accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80;
+--grad-a:#a5b4fc;--grad-b:#67e8f9;--glow-a:rgba(99,102,241,.28);--glow-b:rgba(34,211,238,.16);--chip:#1f2333;--code:#0b0d14;--code-ink:#dfe3f5}
 *{box-sizing:border-box}html,body{margin:0;height:100%}
-body{background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-.app{max-width:900px;margin:0 auto;padding:16px;display:flex;flex-direction:column;height:100%}
-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-h1{font-size:20px;margin:0}h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.display{font-family:Unbounded,Inter,system-ui,sans-serif;letter-spacing:-.01em}
+code,pre,.mono{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+.app{max-width:900px;margin:0 auto;padding:16px;display:none;flex-direction:column;height:100vh;height:100dvh}
+body.chatting .app{display:flex}body.chatting #home{display:none}
+.app h1{font-family:Unbounded,Inter,sans-serif;font-weight:700}
+.home-link{color:var(--muted);text-decoration:none;font-size:13px}.home-link:hover{color:var(--ink)}
+.app header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.app h1{font-size:20px;margin:0}.app h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .status{font-size:12px;color:var(--muted);margin-left:auto}
-nav{display:flex;gap:4px;margin:12px 0;border-bottom:1px solid var(--line);overflow-x:auto}
-nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:8px 12px;font:inherit;cursor:pointer}
-nav button.on{color:var(--ink);border-color:var(--accent)}
-section{display:none;flex:1;min-height:0;flex-direction:column;gap:10px}section.on{display:flex}
+.app nav{display:flex;gap:4px;margin:12px 0;border-bottom:1px solid var(--line);overflow-x:auto}
+.app nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:8px 12px;font:inherit;cursor:pointer}
+.app nav button.on{color:var(--ink);border-color:var(--accent)}
+.app>section{display:none;flex:1;min-height:0;flex-direction:column;gap:10px}.app>section.on{display:flex}
 #log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:4px 2px}
 .msg{max-width:85%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
 .me{align-self:flex-end;background:var(--me);color:var(--me-ink);border-bottom-right-radius:4px}
@@ -1495,11 +1507,244 @@ label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4
 pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;flex:1;margin:0;font-size:13px}
 iframe{width:100%;background:#fff}
 a{color:var(--accent)}
+
+/* ---------- landing page ---------- */
+#home{overflow-x:hidden}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+.topbar{position:sticky;top:0;z-index:5;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  background:color-mix(in srgb,var(--bg) 78%,transparent);border-bottom:1px solid var(--line)}
+.topbar .wrap{display:flex;align-items:center;gap:20px;height:60px}
+.logo{font-family:Unbounded,sans-serif;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none;display:flex;align-items:center;gap:8px}
+.logo i{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,var(--grad-a),var(--grad-b));display:inline-block}
+.toplinks{display:flex;gap:18px;margin-left:auto}.toplinks a{color:var(--muted);text-decoration:none;font-size:14px}
+.toplinks a:hover{color:var(--ink)}
+@media(max-width:760px){.toplinks{display:none}.topbar .btn{margin-left:auto}}
+.btn{display:inline-flex;align-items:center;gap:8px;border-radius:12px;padding:11px 18px;font:600 15px/1 Inter,sans-serif;
+  text-decoration:none;cursor:pointer;border:1px solid transparent;white-space:nowrap}
+.btn-primary{background:linear-gradient(135deg,var(--grad-a),var(--grad-b));color:#fff;box-shadow:0 8px 24px var(--glow-a)}
+.btn-primary:hover{filter:brightness(1.08)}
+.btn-ghost{background:var(--panel);color:var(--ink);border-color:var(--line)}.btn-ghost:hover{border-color:var(--accent)}
+.btn-sm{padding:8px 14px;font-size:14px}
+.hero{position:relative;padding:84px 0 56px;text-align:center}
+.hero:before,.hero:after{content:"";position:absolute;z-index:-1;border-radius:50%;filter:blur(70px)}
+.hero:before{width:520px;height:420px;left:50%;top:-60px;transform:translateX(-85%);background:var(--glow-a)}
+.hero:after{width:460px;height:380px;left:50%;top:40px;transform:translateX(5%);background:var(--glow-b)}
+.eyebrow{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--chip);
+  color:var(--muted);font-size:13px;border:1px solid var(--line)}
+.eyebrow b{color:var(--ink);font-weight:600}.eyebrow .dot{flex:none}
+.dot{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.2)}
+.hero h1{font-family:Unbounded,sans-serif;font-weight:800;font-size:clamp(44px,9vw,104px);line-height:1;margin:22px 0 18px;
+  letter-spacing:-.03em;background:linear-gradient(120deg,var(--ink) 30%,var(--grad-a) 65%,var(--grad-b));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:clamp(17px,2.2vw,21px);color:var(--ink);max-width:720px;margin:0 auto 10px}
+.quote{color:var(--muted);max-width:680px;margin:0 auto;font-size:15px}
+.askbox{max-width:680px;margin:34px auto 0;display:flex;gap:8px;padding:8px;background:var(--panel);border:1px solid var(--line);
+  border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.08)}
+.askbox input{flex:1;border:0;background:transparent;font-size:16px;padding:10px 12px}
+.askbox input:focus{outline:none}
+.askbox:focus-within{border-color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:14px auto 0;max-width:720px}
+.chips button{background:var(--chip);color:var(--ink);border:1px solid var(--line);border-radius:999px;padding:6px 12px;
+  font:13px Inter,sans-serif;cursor:pointer}.chips button:hover{border-color:var(--accent)}
+.cta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:26px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);
+  border-radius:16px;overflow:hidden;margin:8px 0 0}
+.stat{background:var(--panel);padding:18px 16px;text-align:center}
+.stat b{display:block;font-family:Unbounded,sans-serif;font-weight:700;font-size:22px}
+.stat span{color:var(--muted);font-size:13px}
+@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}.stat:last-child{grid-column:span 2}}
+.block{padding:72px 0 8px}
+.kicker{font:600 12px/1 Inter,sans-serif;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+.block h2{font-family:Unbounded,sans-serif;font-weight:700;font-size:clamp(26px,4vw,38px);line-height:1.15;margin:10px 0 12px;letter-spacing:-.02em}
+.block .sub{color:var(--muted);max-width:680px;margin:0 0 28px}
+.features{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+@media(max-width:980px){.features{grid-template-columns:repeat(2,1fr)}}@media(max-width:520px){.features{grid-template-columns:1fr}}
+.feat{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;transition:transform .15s,border-color .15s}
+.feat:hover{transform:translateY(-2px);border-color:var(--accent)}
+.feat svg{width:36px;height:36px;padding:7px;border-radius:10px;background:var(--chip);color:var(--accent)}
+.feat h3{font-size:16px;margin:14px 0 6px}.feat p{margin:0;color:var(--muted);font-size:14px}
+.steps{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;counter-reset:s}
+@media(max-width:980px){.steps{grid-template-columns:1fr}}
+.step{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px}
+.step:before{counter-increment:s;content:counter(s,decimal-leading-zero);font-family:Unbounded,sans-serif;font-weight:700;font-size:28px;
+  background:linear-gradient(135deg,var(--grad-a),var(--grad-b));-webkit-background-clip:text;background-clip:text;color:transparent}
+.step h3{font-size:15px;margin:8px 0 6px}.step p{margin:0;color:var(--muted);font-size:14px}
+@media(max-width:980px){.step{display:grid;grid-template-columns:52px 1fr;column-gap:12px;padding:16px}
+  .step:before{grid-row:span 2;font-size:24px;line-height:1.2}.step h3{margin:2px 0 4px}}
+.notice-demo{margin-top:14px;background:var(--note);color:var(--note-ink);border-radius:12px;padding:12px 14px;font-size:14px}
+.editions{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:760px){.editions{grid-template-columns:1fr}}
+.ed{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:24px}
+.ed h3{font-family:Unbounded,sans-serif;font-weight:700;font-size:20px;margin:0 0 4px}
+.ed .tag{color:var(--muted);font-size:14px;margin:0 0 14px}
+.ed ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px}
+.ed li{padding-left:24px;position:relative;font-size:14px}
+.ed li:before{content:"";position:absolute;left:0;top:6px;width:12px;height:12px;border-radius:4px;background:linear-gradient(135deg,var(--grad-a),var(--grad-b))}
+.gen{display:grid;grid-template-columns:1fr 1.4fr;gap:14px}@media(max-width:860px){.gen{grid-template-columns:1fr}}
+.table{width:100%;border-collapse:collapse;font-size:14px}
+.table th,.table td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.table th{color:var(--muted);font-weight:500;font-size:13px}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:var(--chip);color:var(--muted)}
+.pill.on{background:rgba(34,197,94,.15);color:#16a34a}
+.tscroll{overflow-x:auto}
+.codebox{white-space:pre;flex:none;background:var(--code);color:var(--code-ink);border-radius:16px;padding:18px;overflow-x:auto;font-size:13px;line-height:1.6;margin:0;border:1px solid var(--line)}
+.codebox .c{color:#8b93b5}.codebox .k{color:#93c5fd}.codebox .s{color:#86efac}
+.endpoints{display:grid;grid-template-columns:repeat(2,1fr);gap:8px 18px;margin:0;padding:0;list-style:none}
+@media(max-width:620px){.endpoints{grid-template-columns:1fr}}
+.endpoints li{font-size:14px;color:var(--muted)}.endpoints code{color:var(--ink);font-size:13px}
+.final{margin:80px 0 0;padding:56px 24px;text-align:center;border-radius:24px;border:1px solid var(--line);
+  background:radial-gradient(600px 240px at 20% 0%,var(--glow-a),transparent),radial-gradient(500px 240px at 90% 100%,var(--glow-b),transparent),var(--panel)}
+.final h2{font-family:Unbounded,sans-serif;font-size:clamp(24px,4vw,36px);margin:0 0 10px}
+footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
 </style>
 </head>
 <body>
+<div id="home">
+<div class="topbar"><div class="wrap">
+  <a class="logo" href="#" aria-label="Titan-23M home"><i></i>TITAN</a>
+  <nav class="toplinks" aria-label="Sections"><a href="#features">Features</a><a href="#learn">How it learns</a><a href="#editions">Editions</a><a href="#generators">Generators</a><a href="#api">API</a></nav>
+  <button class="btn btn-primary btn-sm" data-start>Start chatting</button>
+</div></div>
+
+<div class="wrap">
+<header class="hero">
+  <span class="eyebrow"><span class="dot"></span><span><b>Free &amp; open source</b> · PyTorch · <span id="hEdition">online</span></span></span>
+  <h1>Titan-23M</h1>
+  <p class="lead">A free AI with 23 million parameters that learns what it doesn't know. It keeps its memory in <b>TITAN.md</b>, and when it can't answer, its teacher <b>gpt-oss-120b</b> on Cloudflare teaches it.</p>
+  <p class="quote">Download it as one file or talk to it right here in the browser. You can connect it to an MCP server, or ask it to use a connector like web search.</p>
+  <form class="askbox" id="heroForm"><input id="heroIn" autocomplete="off" placeholder="Ask Titan anything…" aria-label="Ask Titan"><button class="btn btn-primary">Ask</button></form>
+  <div class="chips" id="chips">
+    <button type="button">Who are you?</button><button type="button">What can you do?</button>
+    <button type="button">How do you learn?</button><button type="button">/image a lighthouse at sunset</button>
+    <button type="button">/search Alan Turing</button>
+  </div>
+  <div class="cta">
+    <button class="btn btn-primary" data-start>Start chatting →</button>
+    <a class="btn btn-ghost" href="https://github.com/vendemiaraul-cyber/Free-AI-Titan-23M" target="_blank" rel="noopener">Download titan.py</a>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat"><b id="sParams">23.0M</b><span>parameters</span></div>
+  <div class="stat"><b id="sFacts">—</b><span>facts in TITAN.md</span></div>
+  <div class="stat"><b>7 × 512</b><span>layers × width</span></div>
+  <div class="stat"><b>1,536</b><span>bytes of context</span></div>
+  <div class="stat"><b id="sTeacher">gpt-oss-120b</b><span>cloud teacher</span></div>
+</div>
+
+<section class="block" id="features">
+  <div class="kicker">Features</div>
+  <h2>Small model, lots of tricks</h2>
+  <p class="sub">Everything comes in one Python file, or in the browser edition you're looking at.</p>
+  <div class="features">
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0-6 6c0 2.2 1.2 3.6 2.4 4.8.8.8 1.1 1.5 1.1 2.7V18h5v-1.5c0-1.2.3-1.9 1.1-2.7C16.8 12.6 18 11.2 18 9a6 6 0 0 0-6-6Z"/><path d="M10 21h4"/></svg>
+      <h3>Learns from the cloud</h3><p>When it can't answer, it asks gpt-oss-120b on Cloudflare, posts an automatic report and trains on the answer.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>
+      <h3>TITAN.md memory</h3><p>Every fact it knows is a Markdown entry you can read, edit or teach yourself with /teach.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>
+      <h3>Perchance images</h3><p>Pictures come from Titan's own generator on perchance.org, built right into the Image tab.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="15" height="14" rx="2"/><path d="m17 10 5-3v10l-5-3"/></svg>
+      <h3>Video generators</h3><p>CogVideoX, LTX-Video, Wan 2.1, ModelScope and SVD run on your device. Animate also works online.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <h3>Web search connector</h3><p>/search uses DuckDuckGo instant answers and Wikipedia, with no key needed.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7 4 12l5 5M15 7l5 5-5 5"/></svg>
+      <h3>MCP server &amp; client</h3><p>Plug Titan into any MCP app, or connect it to other MCP servers and call their tools.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10"/><path d="M2 19h20M8 9l-2 2 2 2M16 9l2 2-2 2"/></svg>
+      <h3>OpenAI-compatible API</h3><p>/v1/chat/completions works with existing SDKs, alongside image, video, teach and search endpoints.</p></div>
+    <div class="feat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+      <h3>One file, or the browser</h3><p>titan.py holds the model, memory, generators, API and UI. Or just chat online.</p></div>
+  </div>
+</section>
+
+<section class="block" id="learn">
+  <div class="kicker">How it learns</div>
+  <h2>It knows when it doesn't know</h2>
+  <p class="sub">Titan checks its own answer. It needs a high token probability, and the words must be real words from TITAN.md, not garble.</p>
+  <div class="steps">
+    <div class="step"><h3>Recall</h3><p>Finds the closest entry in TITAN.md and reads it as context.</p></div>
+    <div class="step"><h3>Answer</h3><p>The 23M-parameter transformer writes a draft byte by byte.</p></div>
+    <div class="step"><h3>Check</h3><p>Low confidence, garbled words, or nothing in TITAN.md means it can't elaborate.</p></div>
+    <div class="step"><h3>Cloud call</h3><p>gpt-oss-120b answers, and an automatic message reports it.</p></div>
+    <div class="step"><h3>Train</h3><p>The lesson is added to TITAN.md and Titan fine-tunes on it in the background.</p></div>
+  </div>
+  <div class="notice-demo">🔔 Automatic report: Titan couldn't elaborate a response (confidence 0.21, nothing about it in TITAN.md). Cloud call → learned from gpt-oss-120b on Cloudflare → TITAN.md updated (entry #27) → training on it in the background.</div>
+</section>
+
+<section class="block" id="editions">
+  <div class="kicker">Two editions</div>
+  <h2>Download it, or talk to it online</h2>
+  <p class="sub">Both editions share the same memory format, API and this interface.</p>
+  <div class="editions">
+    <div class="ed"><h3>Single file</h3><p class="tag">titan.py · runs on your device</p>
+      <ul><li>The PyTorch Titan-23M model, trained on TITAN.md</li><li>Learns in the background while you chat</li>
+      <li>Drives the Perchance generator and saves your images</li><li>Runs every video generator locally</li>
+      <li>REST API, OpenAI-compatible chat, and MCP over stdio or HTTP</li></ul></div>
+    <div class="ed"><h3>In the browser</h3><p class="tag">Cloudflare edition · nothing to install</p>
+      <ul><li>Chat straight from this page</li><li>TITAN.md stored in the cloud and shared with titan.py</li>
+      <li>gpt-oss-120b teaches it whatever it doesn't know</li><li>Perchance images and browser-made animate videos</li>
+      <li>REST API, OpenAI-compatible chat, and MCP over HTTP</li></ul></div>
+  </div>
+</section>
+
+<section class="block" id="generators">
+  <div class="kicker">Generators</div>
+  <h2>Images and video</h2>
+  <p class="sub">Images come from Perchance. Video generators run on your device, and only some of them also work online.</p>
+  <div class="gen">
+    <div class="ed"><h3>Image</h3><p class="tag">Titan's generator on perchance.org</p>
+      <p style="margin:0 0 14px;font-size:14px">Type <code>/image</code> and a prompt in chat, or use the Image tab with the generator built in.</p>
+      <a class="btn btn-ghost btn-sm" href="https://perchance.org/rg4m14ri" target="_blank" rel="noopener">Open perchance.org/rg4m14ri</a></div>
+    <div class="ed"><h3>Video</h3><p class="tag">/video or the Video tab</p>
+      <div class="tscroll"><table class="table">
+        <tr><th>Generator</th><th>Makes</th><th>Where</th></tr>
+        <tr><td><b>animate</b></td><td>image → video</td><td><span class="pill on">online</span> <span class="pill">device</span></td></tr>
+        <tr><td><b>cogvideox</b></td><td>text → video</td><td><span class="pill">device</span></td></tr>
+        <tr><td><b>ltx</b></td><td>text → video</td><td><span class="pill">device</span></td></tr>
+        <tr><td><b>wan</b> 2.1</td><td>text → video</td><td><span class="pill">device</span></td></tr>
+        <tr><td><b>modelscope</b></td><td>text → video</td><td><span class="pill">device</span></td></tr>
+        <tr><td><b>svd</b></td><td>image → video</td><td><span class="pill">device</span></td></tr>
+      </table></div></div>
+  </div>
+</section>
+
+<section class="block" id="api">
+  <div class="kicker">API</div>
+  <h2>Build on Titan</h2>
+  <p class="sub">Every feature is an endpoint. Chat is OpenAI-compatible, so existing SDKs work.</p>
+  <div class="gen">
+<pre class="codebox"><span class="c"># chat with Titan</span>
+<span class="k">curl</span> <span id="apiBase">http://127.0.0.1:8023</span>/v1/chat \
+  -H <span class="s">'Content-Type: application/json'</span> \
+  -d <span class="s">'{"message": "What can you do?"}'</span>
+
+<span class="c"># reply, confidence, source and any automatic reports</span>
+{ <span class="s">"reply"</span>: <span class="s">"I can chat, answer questions…"</span>,
+  <span class="s">"source"</span>: <span class="s">"titan"</span>, <span class="s">"confidence"</span>: 0.94,
+  <span class="s">"notices"</span>: [] }</pre>
+    <ul class="endpoints">
+      <li><code>POST /v1/chat</code><br>chat, including slash commands</li>
+      <li><code>POST /v1/chat/completions</code><br>OpenAI-compatible</li>
+      <li><code>POST /v1/image</code><br>Perchance image</li>
+      <li><code>POST /v1/video</code><br>video on your device</li>
+      <li><code>POST /v1/teach</code><br>teach Titan an answer</li>
+      <li><code>GET /v1/knowledge</code><br>read TITAN.md</li>
+      <li><code>GET /v1/search?q=</code><br>web search connector</li>
+      <li><code>POST /mcp</code><br>MCP JSON-RPC</li>
+    </ul>
+  </div>
+</section>
+
+<div class="final">
+  <h2>Say hi to Titan</h2>
+  <p class="quote" style="margin-bottom:22px">If it doesn't know the answer yet, it will once it's done learning.</p>
+  <button class="btn btn-primary" data-start>Start chatting →</button>
+</div>
+<footer>Free-AI-Titan-23M · PyTorch · TITAN.md · gpt-oss-120b on Cloudflare · images by Perchance</footer>
+</div>
+</div>
+
 <div class="app">
 <header>
+  <a class="home-link" href="#" id="homeLink">← Home</a>
   <h1>Titan-23M <small id="edition"></small></h1>
   <span class="status" id="status">connecting…</span>
 </header>
@@ -1572,8 +1817,8 @@ async function api(path, body){
   return data;
 }
 // tabs + settings
-document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
-  document.querySelectorAll("nav button,section").forEach(x=>x.classList.remove("on"));
+document.querySelectorAll(".app nav button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll(".app nav button,.app>section").forEach(x=>x.classList.remove("on"));
   b.classList.add("on"); $("#"+b.dataset.tab).classList.add("on");
   if(b.dataset.tab==="knowledge") loadMd();
 });
@@ -1582,9 +1827,25 @@ $("#theme").value=store.get("titanTheme"); applyTheme();
 $("#theme").onchange=e=>{store.set("titanTheme",e.target.value);applyTheme()};
 function applyTheme(){const t=store.get("titanTheme"); if(t)document.documentElement.dataset.theme=t; else delete document.documentElement.dataset.theme;}
 
+// landing page <-> app
+function openApp(tab){document.body.classList.add("chatting"); if(location.hash!=="#chat") history.pushState(null,"","#chat");
+  if(tab) document.querySelector(`nav button[data-tab="${tab}"]`).click(); setTimeout(()=>$("#chatIn").focus(),0);}
+function showHome(){document.body.classList.remove("chatting"); if(location.hash==="#chat") history.pushState(null,"",location.pathname); window.scrollTo(0,0);}
+document.querySelectorAll("[data-start]").forEach(b=>b.onclick=()=>openApp("chat"));
+$("#homeLink").onclick=e=>{e.preventDefault();showHome()};
+window.addEventListener("popstate",()=>location.hash==="#chat"?document.body.classList.add("chatting"):document.body.classList.remove("chatting"));
+if(location.hash==="#chat") document.body.classList.add("chatting");
+$("#heroForm").onsubmit=e=>{e.preventDefault(); const m=$("#heroIn").value.trim(); $("#heroIn").value=""; openApp("chat"); if(m) send(m);};
+document.querySelectorAll("#chips button").forEach(b=>b.onclick=()=>{openApp("chat"); send(b.textContent);});
+$("#apiBase").textContent=location.origin;
+
 let EDITION="";
 api("/v1/health").then(h=>{
   EDITION=h.edition||""; $("#edition").textContent=EDITION;
+  $("#hEdition").textContent=EDITION==="Cloudflare"?"in your browser":"on your device";
+  if(h.parameters) $("#sParams").textContent=(h.parameters/1e6).toFixed(1)+"M";
+  if(h.knowledge_entries!=null) $("#sFacts").textContent=h.knowledge_entries;
+  if(h.teacher) $("#sTeacher").textContent=h.teacher;
   $("#status").textContent=[h.parameters?(h.parameters/1e6).toFixed(1)+"M params":"", h.knowledge_entries+" facts",
     "teacher: "+(h.teacher||"gpt-oss-120b")].filter(Boolean).join(" · ");
 }).catch(e=>$("#status").textContent="offline: "+e.message);
@@ -1600,8 +1861,8 @@ function media(r){
   return h;
 }
 add("bot","Hi, I'm Titan. Ask me anything. When I don't know, my teacher gpt-oss-120b on Cloudflare teaches me and I write it into TITAN.md. Type /help for commands.");
-$("#chatForm").onsubmit=async e=>{
-  e.preventDefault(); const m=$("#chatIn").value.trim(); if(!m)return; $("#chatIn").value="";
+$("#chatForm").onsubmit=e=>{e.preventDefault(); const m=$("#chatIn").value.trim(); if(!m)return; $("#chatIn").value=""; send(m);};
+async function send(m){
   add("me",esc(m)); const wait=add("bot","…");
   try{
     const r=await api("/v1/chat",{message:m});

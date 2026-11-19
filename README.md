@@ -51,7 +51,7 @@ you ──► Titan-23M (PyTorch) ──► confident? ──yes──► answer
 ```bash
 pip install torch pillow
 python titan.py train            # first training on TITAN.md (≈2.5 s/step on a laptop CPU, seconds on a GPU)
-python titan.py serve            # browser UI + API on http://127.0.0.1:8023
+python titan.py serve            # main page + chat UI + API on http://127.0.0.1:8023
 python titan.py chat             # terminal chat
 python titan.py ask "Who are you?"
 python titan.py image "a lighthouse at sunset"
@@ -60,6 +60,9 @@ python titan.py mcp              # MCP server over stdio
 python titan.py sync             # pull/push TITAN.md with the cloud + learn queued questions
 python titan.py info
 ```
+
+`/` is Titan's main page (features, how it learns, editions, generators, API) with a chat box
+to start chatting; `/#chat` opens the chat app directly.
 
 If there's no `titan.pt` yet, `serve` and `chat` start a background bootstrap training
 automatically.
