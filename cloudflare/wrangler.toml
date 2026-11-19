@@ -1,0 +1,21 @@
+# Free-AI-Titan-23M — the same app as a plain Cloudflare Worker (instead of Pages)
+name = "free-ai-titan-23m"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = true
+
+[vars]
+TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
+PERCHANCE_URL = "https://perchance.org/rg4m14ri"
+PUBLIC_CHAT = "true"
+RECALL_THRESHOLD = "0.55"
+
+# [[kv_namespaces]]
+# binding = "KNOWLEDGE"
+# id = "<your KV namespace id>"

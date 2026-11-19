@@ -115,9 +115,11 @@ or over HTTP at `http://127.0.0.1:8023/mcp` while `titan.py serve` runs.
 
 ## Cloudflare edition (`cloudflare/`)
 
-The browser edition of Titan, running as a Cloudflare Worker (`wrangler.toml` at the repo root,
-code in `cloudflare/src/`). It shares the browser UI and `TITAN.md` with `titan.py`: after editing
-`UI_HTML` or `TITAN.md`, run `python tools/build_worker_ui.py`.
+The browser edition of Titan, on Cloudflare Pages or Workers. The code lives in `cloudflare/src/`;
+`public/_worker.js` is the same app bundled for Pages (`wrangler.toml` at the repo root), and
+`cloudflare/wrangler.toml` runs it as a plain Worker. It shares the browser UI and `TITAN.md` with
+`titan.py`: after editing `UI_HTML` or `TITAN.md`, run `npm run build:ui`; after editing
+`cloudflare/src`, run `npm run build`.
 
 ## API
 

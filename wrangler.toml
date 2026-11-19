@@ -1,14 +1,11 @@
-# Free-AI-Titan-23M — Cloudflare edition (the browser UI + API + MCP)
+# Free-AI-Titan-23M — Cloudflare Pages (the browser UI + API + MCP)
+# public/_worker.js is the whole app (bundled from cloudflare/src by `npm run build`).
 name = "free-ai-titan-23m"
-main = "cloudflare/src/index.js"
+pages_build_output_dir = "./public"
 compatibility_date = "2025-09-01"
-workers_dev = true
 
 [ai]
 binding = "AI"
-
-[observability]
-enabled = true
 
 [vars]
 TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
