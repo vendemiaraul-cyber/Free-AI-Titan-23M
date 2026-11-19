@@ -53,12 +53,88 @@ with by from as it its this that these those i you he she we they me my your our
 which who whom how why when where can could would should will shall may might please tell
 about there here have has had so if then than just also not no yes hey`.split(/\s+/));
 
-const words = (t) => (String(t).toLowerCase().match(/[a-z0-9]+/g) || []).filter((w) => !STOPWORDS.has(w));
+// Same recall logic as titan.py: chat-speak, contractions, synonyms, stemming and typo fixing,
+// so reworded questions are answered from TITAN.md instead of calling the cloud teacher.
+const CHAT_WORDS = {
+  u: "you", ya: "you", yu: "you", ur: "your", yr: "your", r: "are", y: "why", im: "i am",
+  thx: "thanks", thnx: "thanks", thanx: "thanks", ty: "thanks", tysm: "thanks", pls: "please",
+  plz: "please", wat: "what", wut: "what", wht: "what", hii: "hi", hiii: "hi", hiya: "hi",
+  hai: "hi", helo: "hello", hullo: "hello", hellooo: "hello", heya: "hey", yo: "hey",
+  sup: "what is up", wassup: "what is up", whatsup: "what is up", gm: "good morning",
+  gn: "good night", bye: "goodbye", cya: "goodbye", bb: "goodbye", k: "ok", kk: "ok",
+  okay: "ok", okey: "ok", pic: "picture", pics: "pictures", vid: "video", vids: "videos",
+};
+const SYNONYMS = {
+  make: "generate", create: "generate", produce: "generate", draw: "generate", render: "generate",
+  made: "generate", makes: "generate", making: "generate", created: "generate", creates: "generate",
+  creating: "generate", built: "generate", build: "generate",
+  picture: "image", photo: "image", drawing: "image", illustration: "image", art: "image",
+  clip: "video", movie: "video", film: "video", animation: "video",
+  internet: "web", online: "web", net: "web", browse: "search", google: "search", lookup: "search",
+  train: "teacher", trains: "teacher", trained: "teacher", trainer: "teacher", taught: "teacher",
+  learns: "learn", learning: "learn",
+  params: "parameter", weights: "parameter", big: "size", large: "size",
+  install: "download", grab: "download", thank: "thanks",
+};
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+export function normalize(text) {
+  let t = String(text).toLowerCase().replace(/\u2019/g, "'");
+  t = t.replace(/\b(what|who|how|where|when|that|it|there|here)'?s\b/g, "$1 is")
+    .replace(/n't\b/g, " not").replace(/'re\b/g, " are").replace(/'m\b/g, " am")
+    .replace(/'ll\b/g, " will").replace(/'ve\b/g, " have");
+  const out = [];
+  for (const w of t.match(/[a-z0-9]+/g) || [])
+    for (const x of (has(CHAT_WORDS, w) ? CHAT_WORDS[w] : w).split(" ")) out.push(has(SYNONYMS, x) ? SYNONYMS[x] : x);
+  return out;
+}
+const words = (t) => normalize(t).filter((w) => !STOPWORDS.has(w));
 const stem = (w) => {
-  for (const s of ["ing", "ies", "es", "ed", "s"]) if (w.length > s.length + 2 && w.endsWith(s)) return w.slice(0, -s.length);
+  if (w.length <= 3) return w;
+  if (w.endsWith("ies") && w.length > 4) return w.slice(0, -3) + "y";
+  if (/(sses|ches|shes|xes|zes)$/.test(w)) return w.slice(0, -2);
+  if (w.endsWith("s") && !/(ss|us|is)$/.test(w)) return w.slice(0, -1);
+  if (w.endsWith("ing") && w.length > 5) return w.slice(0, -3);
+  if (w.endsWith("ed") && w.length > 4) return w.slice(0, -2);
   return w;
 };
+const terms = (t) => words(t).map((w) => { const st = stem(w); return has(SYNONYMS, st) ? SYNONYMS[st] : st; });
 const norm = (q) => String(q).trim().toLowerCase().replace(/[?!. ]+$/, "");
+// key under which two questions count as the same question ("whats ur name" == "What is your name?")
+const qkey = (q) => normalize(q).join(" ") || norm(q);
+
+function editDistance(a, b, limit) {
+  if (Math.abs(a.length - b.length) > limit) return limit + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur.push(Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0)));
+    if (Math.min(...cur) > limit) return limit + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function fixTypo(w, vocab) {
+  if (vocab.has(w) || w.length < 4 || /^\d+$/.test(w)) return w; // short words are too ambiguous ("cat" vs "chat")
+  const limit = w.length < 7 ? 1 : 2;
+  let best = w, bestD = limit + 1;
+  for (const v of vocab) {
+    if (Math.abs(v.length - w.length) <= limit && v[0] === w[0]) {
+      const d = editDistance(w, v, limit);
+      if (d < bestD) { best = v; bestD = d; }
+    }
+  }
+  return best;
+}
+const trigrams = (text) => {
+  const s = `  ${text} `, g = new Map();
+  for (let i = 0; i < s.length - 2; i++) g.set(s.slice(i, i + 3), (g.get(s.slice(i, i + 3)) || 0) + 1);
+  return g;
+};
+const gramSim = (a, b) => {
+  let dot = 0; a.forEach((v, k) => { dot += v * (b.get(k) || 0); });
+  const na = Math.sqrt([...a.values()].reduce((s, v) => s + v * v, 0)), nb = Math.sqrt([...b.values()].reduce((s, v) => s + v * v, 0));
+  return na && nb ? dot / (na * nb) : 0;
+};
 
 export function parseEntries(md) {
   const out = [];
@@ -82,8 +158,8 @@ export function parseEntries(md) {
 
 export function searchEntries(entries, query, k = 3) {
   const n = Math.max(entries.length, 1);
-  const docs = entries.map((e) => words(e.question).map(stem));
-  const ans = entries.map((e) => words(e.answer).map(stem));
+  const docs = entries.map((e) => terms(e.question));
+  const ans = entries.map((e) => terms(e.answer));
   const df = new Map();
   docs.forEach((d, i) => new Set([...d, ...ans[i]]).forEach((w) => df.set(w, (df.get(w) || 0) + 1)));
   const idf = (w) => Math.log(1 + n / (df.get(w) || 1));
@@ -95,15 +171,23 @@ export function searchEntries(entries, query, k = 3) {
     return v;
   };
   const cos = (a, b) => { let s = 0; a.forEach((x, key) => { s += x * (b.get(key) || 0); }); return s; };
-  const q = words(query).map(stem);
-  const nq = norm(query);
-  if (!q.length) return entries.filter((e) => norm(e.question) === nq).slice(0, k).map((e) => [1, e]);
-  const qv = vec(q);
-  return entries
-    .map((e, i) => [norm(e.question) === nq ? 1 : 0.8 * cos(qv, vec(docs[i])) + 0.2 * cos(qv, vec(ans[i])), e])
+  const forms = entries.map((e) => normalize(e.question).join(" "));
+  const form = normalize(query).join(" ");
+  const vocab = new Set(df.keys());
+  const q = terms(query).map((w) => fixTypo(w, vocab));
+  let scored;
+  if (q.length) {
+    const qv = vec(q);
+    scored = entries.map((e, i) => [forms[i] === form ? 1 : 0.8 * cos(qv, vec(docs[i])) + 0.2 * cos(qv, vec(ans[i])), e]);
+  } else { // only small words ("who are you"): compare whole normalised sentences
+    const g = trigrams(form);
+    scored = entries.map((e, i) => [forms[i] === form ? 1 : gramSim(g, trigrams(forms[i])) * (docs[i].length ? 0.8 : 1), e]);
+  }
+  return scored
     .sort((a, b) => b[0] - a[0])
     .slice(0, k)
-    .filter((t) => t[0] > 0);
+    .filter((t) => t[0] > 0)
+    .map(([sc, e]) => [Math.round(sc * 1e4) / 1e4, e]);
 }
 
 export function entryMd(question, answer, source) {
@@ -114,7 +198,7 @@ export function entryMd(question, answer, source) {
 
 export function upsertEntry(md, question, answer, source) {
   const entries = parseEntries(md);
-  const old = entries.find((e) => norm(e.question) === norm(question));
+  const old = entries.find((e) => norm(e.question) === norm(question)) || entries.find((e) => qkey(e.question) === qkey(question));
   const block = entryMd(old ? old.question : question, answer, source);
   if (old) {
     const esc = old.question.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -176,6 +260,31 @@ export async function webSearch(query, limit = 3) {
   return { query, results: results.slice(0, limit + 1) };
 }
 
+// "What is PyTorch?" -> "PyTorch": simple look-up questions about one short subject.
+const LOOKUP_RE = /^\s*(?:(?:what|who|where)\s*(?:is|are|was|were|'s)\s+|define\s+|tell me about\s+|explain\s+|describe\s+|what does\s+)(?:an?\s+|the\s+)?(.+?)(?:\s+mean)?\s*[?.!]*\s*$/i;
+export function lookupSubject(question) {
+  const m = LOOKUP_RE.exec(String(question));
+  if (!m) return null;
+  const subj = m[1].trim().replace(/^["']+|["']+$/g, "");
+  return subj && subj.split(/\s+/).length <= 5 ? subj : null;
+}
+
+/** Answer from Wikipedia when the article is really about the subject: free, no cloud AI call. */
+export async function wikipediaAnswer(question, search = webSearch) {
+  const subj = lookupSubject(question);
+  if (!subj) return null;
+  const want = new Set(terms(subj));
+  if (!want.size) return null;
+  for (const r of (await search(subj, 3)).results || []) {
+    const snippet = (r.snippet || "").trim(), got = new Set(terms(r.title || ""));
+    if (!snippet || snippet.includes("may refer to") || ![...want].every((w) => got.has(w)) || got.size > want.size + 2) continue;
+    const text = snippet.split(/(?<=[.!?])\s+/).slice(0, 3).join(" ").slice(0, 600).trim();
+    const src = (r.source || "web").replace(/^./, (c) => c.toUpperCase());
+    return { answer: `${text} (Source: ${src}${r.url ? ", " + r.url : ""})`, source: r.source || "web", title: r.title };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge + learning
 // ---------------------------------------------------------------------------
@@ -189,7 +298,13 @@ const memStore = {
 const kv = (env) => env.KNOWLEDGE || memStore;
 
 async function getMd(env) {
-  return (await kv(env).get(MD_KEY)) || SEED_MD || DEFAULT_MD;
+  const stored = await kv(env).get(MD_KEY);
+  if (!stored) return SEED_MD || DEFAULT_MD;
+  // A TITAN.md saved by an older version keeps working, and also gets entries added to the repo since.
+  const have = new Set(parseEntries(stored).map((e) => qkey(e.question)));
+  let md = stored;
+  for (const e of parseEntries(SEED_MD || "")) if (!have.has(qkey(e.question))) md = upsertEntry(md, e.question, e.answer, e.meta.source || "seed");
+  return md;
 }
 
 async function report(env, ctx, rec) {
@@ -212,7 +327,7 @@ async function learn(env, ctx, { question, context = "", draft = "", confidence 
   const newMd = upsertEntry(md, question, answer, `cloud:${model}`);
   await kv(env).put(MD_KEY, newMd);
   const entries = parseEntries(newMd);
-  const entry = entries.find((e) => norm(e.question) === norm(question)) || entries[entries.length - 1];
+  const entry = entries.find((e) => qkey(e.question) === qkey(question)) || entries[entries.length - 1];
   const conf = typeof confidence === "number" ? confidence.toFixed(2) : String(confidence);
   const message = `🔔 Automatic report: Titan couldn't elaborate a response to "${question.slice(0, 120)}" ` +
     `(confidence ${conf}${reason ? ", " + reason : ""}, from ${client}). Cloud call → ${model.split("/").pop()} answered → ` +
@@ -269,6 +384,18 @@ async function chat(env, ctx, message) {
     return { reply: hits[0][1].answer, source: "knowledge", confidence: +hits[0][0].toFixed(4), notices: [], knowledge: hits[0][1].id };
   }
   const conf = hits.length ? hits[0][0] : 0;
+  if (String(env.WEB_FIRST || "true") !== "false") { // free Wikipedia look-up before spending a cloud call
+    let found = null;
+    try { found = await wikipediaAnswer(msg, env.__search || webSearch); } catch (e) { found = null; }
+    if (found) {
+      const md = upsertEntry(await getMd(env), msg, found.answer, `web:${found.source}`);
+      await kv(env).put(MD_KEY, md);
+      const entry = parseEntries(md).find((e) => qkey(e.question) === qkey(msg));
+      const message = `🔔 Automatic report: Titan didn't know this yet, so it looked it up on ${found.source.replace(/^./, (c) => c.toUpperCase())} (${found.title}) instead of calling the cloud. TITAN.md updated${entry ? ` (entry #${entry.id})` : ""}.`;
+      await report(env, ctx, { question: msg, reason: "nothing about it in TITAN.md", confidence: conf, client: "browser", model: `web:${found.source}`, entry: entry && entry.id, answer: found.answer, message });
+      return { reply: found.answer, source: `web:${found.source}`, confidence: +conf.toFixed(4), notices: [message], learned: true, entry: entry && entry.id };
+    }
+  }
   const l = await learn(env, ctx, { question: msg, confidence: conf, reason: "nothing about it in TITAN.md", client: "browser" });
   return { reply: l.answer, source: `cloud:${l.model}`, confidence: +conf.toFixed(4), notices: [l.message], learned: true, entry: l.entry.id };
 }
@@ -406,12 +533,12 @@ export default {
         }
         case "/v1/knowledge": { // merge a TITAN.md pushed by titan.py
           let md = await getMd(env);
-          const have = new Set(parseEntries(md).map((e) => norm(e.question)));
+          const have = new Set(parseEntries(md).map((e) => qkey(e.question)));
           let added = 0;
           for (const e of parseEntries(String(body.markdown || ""))) {
-            if (have.has(norm(e.question))) continue;
+            if (have.has(qkey(e.question))) continue;
             md = upsertEntry(md, e.question, e.answer, e.meta.source || "sync");
-            have.add(norm(e.question));
+            have.add(qkey(e.question));
             added++;
           }
           if (added) await kv(env).put(MD_KEY, md);

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="96" alt="Titan logo"></p>
+
 # Free-AI-Titan-23M
 
 The name doesn't give any specs, but it's both downloadable or directly talkable in the browser,
@@ -41,6 +43,14 @@ you ──► Titan-23M (PyTorch) ──► confident? ──yes──► answer
   when nothing relevant is in `TITAN.md` and it isn't very confident (0.90).
 * If the answer is already in `TITAN.md` but the model hasn't learned it yet, Titan answers from
   the file and re-trains on that entry, with no cloud call.
+* **Most questions never reach the cloud.** Titan recognises reworded questions in `TITAN.md`: chat-speak
+  ("whats ur name"), contractions, synonyms ("make a clip" = "generate a video") and typos ("pytorh").
+  Simple look-ups ("what is X", "who was X", "define X") are answered from Wikipedia when an article
+  is really about X, and saved to `TITAN.md`. Only what's left goes to gpt-oss-120b, and once
+  learned it is answered from `TITAN.md` from then on. Turn the Wikipedia step off with
+  `TITAN_WEB_FIRST=0` (`WEB_FIRST = "false"` on the Worker).
+* The Cloudflare edition keeps `TITAN.md` in a Workers KV namespace that Cloudflare creates on
+  deploy, so what it learns survives restarts.
 * If the cloud is unreachable, Titan falls back to Wikipedia (`TITAN_WEB_FALLBACK=1`), or queues
   the question in `titan_reports.jsonl`. `python titan.py sync` learns queued questions later.
 * Training runs on a copy of the model in a background thread, then swaps the new weights in, so

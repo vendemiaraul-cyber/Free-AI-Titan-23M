@@ -133,6 +133,7 @@ class Config:
     cf_api_token: str = ""         # TITAN_CF_API_TOKEN   (direct mode)
     teacher_model: str = TEACHER_MODEL
     web_fallback: bool = True      # learn from Wikipedia if the cloud is unreachable
+    web_first: bool = True         # TITAN_WEB_FIRST: answer "what is X" questions from Wikipedia before the cloud
     # perchance image generator
     perchance_url: str = DEFAULT_PERCHANCE_URL  # TITAN_PERCHANCE_URL to use a different generator
     perchance_prompt_selector: str = "#prompt, textarea, input[type=text]"
@@ -194,6 +195,7 @@ class Config:
         c.cf_api_token = e("TITAN_CF_API_TOKEN", "")
         c.teacher_model = e("TITAN_TEACHER_MODEL", TEACHER_MODEL)
         c.web_fallback = e("TITAN_WEB_FALLBACK", "1") != "0"
+        c.web_first = e("TITAN_WEB_FIRST", "1") != "0"
         c.perchance_url = e("TITAN_PERCHANCE_URL", DEFAULT_PERCHANCE_URL)
         c.perchance_prompt_selector = e("TITAN_PERCHANCE_PROMPT_SELECTOR", c.perchance_prompt_selector)
         c.perchance_negative_selector = e("TITAN_PERCHANCE_NEGATIVE_SELECTOR", c.perchance_negative_selector)
@@ -238,15 +240,104 @@ Cloudflare Workers AI) teaches Titan something it couldn't answer.
 """
 
 
+# Chat-speak and spelling variants -> plain words (applied to questions and TITAN.md alike).
+CHAT_WORDS = {
+    "u": "you", "ya": "you", "yu": "you", "ur": "your", "yr": "your", "r": "are", "y": "why", "im": "i am",
+    "thx": "thanks", "thnx": "thanks", "thanx": "thanks", "ty": "thanks", "tysm": "thanks", "pls": "please",
+    "plz": "please", "wat": "what", "wut": "what", "wht": "what", "hii": "hi", "hiii": "hi", "hiya": "hi",
+    "hai": "hi", "helo": "hello", "hullo": "hello", "hellooo": "hello", "heya": "hey", "yo": "hey",
+    "sup": "what is up", "wassup": "what is up", "whatsup": "what is up", "gm": "good morning",
+    "gn": "good night", "bye": "goodbye", "cya": "goodbye", "bb": "goodbye", "k": "ok", "kk": "ok",
+    "okay": "ok", "okey": "ok", "pic": "picture", "pics": "pictures", "vid": "video", "vids": "videos",
+}
+# Words that mean the same thing for Titan's purposes -> one canonical word.
+SYNONYMS = {
+    "make": "generate", "create": "generate", "produce": "generate", "draw": "generate", "render": "generate",
+    "made": "generate", "makes": "generate", "making": "generate", "created": "generate", "creates": "generate",
+    "creating": "generate", "built": "generate", "build": "generate",
+    "picture": "image", "photo": "image", "drawing": "image", "illustration": "image", "art": "image",
+    "clip": "video", "movie": "video", "film": "video", "animation": "video",
+    "internet": "web", "online": "web", "net": "web", "browse": "search", "google": "search", "lookup": "search",
+    "train": "teacher", "trains": "teacher", "trained": "teacher", "trainer": "teacher", "taught": "teacher",
+    "learns": "learn", "learning": "learn",
+    "params": "parameter", "weights": "parameter", "big": "size", "large": "size",
+    "install": "download", "grab": "download", "thank": "thanks",
+}
+
+
+def normalize(text: str) -> list[str]:
+    """Lowercase, expand contractions and chat-speak, and canonicalise synonyms (keeps stopwords)."""
+    t = text.lower().replace("\u2019", "'")
+    t = re.sub(r"\b(what|who|how|where|when|that|it|there|here)'?s\b", r"\1 is", t)
+    t = re.sub(r"n't\b", " not", t)
+    t = re.sub(r"'re\b", " are", t)
+    t = re.sub(r"'m\b", " am", t)
+    t = re.sub(r"'ll\b", " will", t)
+    t = re.sub(r"'ve\b", " have", t)
+    out = []
+    for w in WORD_RE.findall(t):
+        for x in CHAT_WORDS.get(w, w).split():
+            out.append(SYNONYMS.get(x, x))
+    return out
+
+
 def words(text: str) -> list[str]:
-    return [w for w in WORD_RE.findall(text.lower()) if w not in STOPWORDS]
+    return [w for w in normalize(text) if w not in STOPWORDS]
 
 
 def _stem(w: str) -> str:
-    for suf in ("ing", "ies", "es", "ed", "s"):
-        if len(w) > len(suf) + 2 and w.endswith(suf):
-            return w[: -len(suf)]
+    """Tiny suffix stripper: images/image, videos/video, searches/search, parameters/parameter."""
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith(("sses", "ches", "shes", "xes", "zes")):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    if w.endswith("ing") and len(w) > 5:
+        return w[:-3]
+    if w.endswith("ed") and len(w) > 4:
+        return w[:-2]
     return w
+
+
+def terms(text: str) -> list[str]:
+    """The words Titan searches by: content words, stemmed, with synonyms mapped (pictures -> image)."""
+    out = []
+    for w in words(text):
+        st = _stem(w)
+        out.append(SYNONYMS.get(st, st))
+    return out
+
+
+def _edit_distance(a: str, b: str, limit: int) -> int:
+    """Levenshtein distance, giving up (returning limit + 1) once it must exceed `limit`."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > limit:
+            return limit + 1
+        prev = cur
+    return prev[-1]
+
+
+def _trigrams(text: str) -> dict:
+    s = f"  {text} "
+    grams: dict[str, int] = {}
+    for i in range(len(s) - 2):
+        grams[s[i:i + 3]] = grams.get(s[i:i + 3], 0) + 1
+    return grams
+
+
+def _gram_sim(a: dict, b: dict) -> float:
+    dot = sum(v * b.get(k, 0) for k, v in a.items())
+    na, nb = math.sqrt(sum(v * v for v in a.values())), math.sqrt(sum(v * v for v in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
 
 
 @dataclass
@@ -298,8 +389,8 @@ class KnowledgeBase:
             self._index()
 
     def _index(self) -> None:
-        docs = [[_stem(w) for w in words(e.question)] for e in self.entries]
-        ans = [[_stem(w) for w in words(e.answer)] for e in self.entries]
+        docs = [terms(e.question) for e in self.entries]
+        ans = [terms(e.answer) for e in self.entries]
         n = max(len(docs), 1)
         df: dict[str, int] = {}
         for d, a in zip(docs, ans):
@@ -308,6 +399,9 @@ class KnowledgeBase:
         self.idf = {w: math.log(1 + n / c) for w, c in df.items()}
         self.vecs = [(self._vec(d), self._vec(a)) for d, a in zip(docs, ans)]
         self.vocab = set(WORD_RE.findall(self.text.lower()))
+        self.qforms = [" ".join(normalize(e.question)) for e in self.entries]  # full normalised questions
+        self.qgrams = [_trigrams(f) for f in self.qforms]
+        self.qcontent = [bool(d) for d in docs]
 
     def word_validity(self, text: str) -> float:
         """Share of the words in `text` that Titan has ever seen in TITAN.md (garbled words aren't)."""
@@ -330,28 +424,50 @@ class KnowledgeBase:
             a, b = b, a
         return sum(x * b.get(k, 0.0) for k, x in a.items())
 
+    def _fix_typo(self, w: str) -> str:
+        """Map an unknown word to the closest word TITAN.md knows (1 edit for short words, 2 for long)."""
+        if w in self.idf or len(w) < 4 or w.isdigit():  # short words are too ambiguous ("cat" vs "chat")
+            return w
+        limit = 1 if len(w) < 7 else 2
+        best, best_d = w, limit + 1
+        for v in self.idf:
+            if abs(len(v) - len(w)) <= limit and v[0] == w[0]:
+                d = _edit_distance(w, v, limit)
+                if d < best_d:
+                    best, best_d = v, d
+        return best
+
     def search(self, query: str, k: int = 3) -> list[tuple[float, Entry]]:
+        """Score every entry against the question. Handles rewording (chat-speak, contractions,
+        synonyms), typos, and questions made only of small words ("who are you", "what can you do")."""
         with self.lock:
-            qtok = [_stem(w) for w in words(query)]
-            if not qtok:  # e.g. "hi" is not a stopword, but "how are you" is all stopwords
-                low = query.strip().lower().rstrip("?!. ")
-                exact = [(1.0, e) for e in self.entries if e.question.lower().rstrip("?!. ") == low]
-                return exact[:k]
-            qv = self._vec(qtok)
+            form = " ".join(normalize(query))
+            qtok = [self._fix_typo(w) for w in terms(query)]
             scored = []
-            for e, (dv, av) in zip(self.entries, self.vecs):
-                s = 0.8 * self._cos(qv, dv) + 0.2 * self._cos(qv, av)
-                if e.question.strip().lower().rstrip("?!. ") == query.strip().lower().rstrip("?!. "):
-                    s = 1.0
-                scored.append((s, e))
+            if qtok:
+                qv = self._vec(qtok)
+                for i, (e, (dv, av)) in enumerate(zip(self.entries, self.vecs)):
+                    s = 0.8 * self._cos(qv, dv) + 0.2 * self._cos(qv, av)
+                    scored.append((1.0 if self.qforms[i] == form else s, e))
+            else:  # only small words: compare the whole normalised sentence with questions like it
+                g = _trigrams(form)
+                for i, e in enumerate(self.entries):
+                    sim = _gram_sim(g, self.qgrams[i])
+                    if self.qcontent[i]:
+                        sim *= 0.8  # "how are you" should prefer "How are you?" over "Hi, how are you?"
+                    scored.append((1.0 if self.qforms[i] == form else sim, e))
             scored.sort(key=lambda t: -t[0])
-            return [t for t in scored[:k] if t[0] > 0]
+            return [(round(s, 4), e) for s, e in scored[:k] if s > 0]
 
     # -- writing ---------------------------------------------------------------
     def find_exact(self, question: str) -> Optional[Entry]:
         q = question.strip().lower().rstrip("?!. ")
         for e in self.entries:
             if e.question.strip().lower().rstrip("?!. ") == q:
+                return e
+        form = " ".join(normalize(question))  # "whats ur name" is the same question as "What is your name?"
+        for e in self.entries:
+            if form and " ".join(normalize(e.question)) == form:
                 return e
         return None
 
@@ -686,6 +802,41 @@ def web_search(query: str, limit: int = 3) -> dict:
     except Exception as ex:
         log("wikipedia failed:", ex)
     return {"query": query, "results": results[: limit + 1]}
+
+
+LOOKUP_RE = re.compile(
+    r"^\s*(?:(?:what|who|where)\s*(?:is|are|was|were|'s)\s+|define\s+|tell me about\s+|explain\s+|describe\s+"
+    r"|what does\s+)(?:an?\s+|the\s+)?(?P<subj>.+?)(?:\s+mean)?\s*[?.!]*\s*$", re.I)
+
+
+def lookup_subject(question: str) -> Optional[str]:
+    """'What is PyTorch?' -> 'PyTorch'. Only simple look-up questions about one short subject."""
+    m = LOOKUP_RE.match(question)
+    if not m:
+        return None
+    subj = m.group("subj").strip(" \"'")
+    return subj if subj and len(subj.split()) <= 5 else None
+
+
+def wikipedia_answer(question: str, search: Callable[..., dict] = None) -> Optional[dict]:
+    """Answer a look-up question from Wikipedia, but only when the article is really about the subject
+    (its title contains every word of the subject and little else). Free, and no cloud AI call."""
+    subj = lookup_subject(question)
+    if not subj:
+        return None
+    want = set(terms(subj))
+    if not want:
+        return None
+    for r in (search or web_search)(subj, limit=3).get("results", []):
+        snippet, title = (r.get("snippet") or "").strip(), r.get("title") or ""
+        got = set(terms(title))
+        if not snippet or "may refer to" in snippet or not want <= got or len(got) > len(want) + 2:
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", snippet)
+        text = " ".join(sentences[:3])[:600].strip()
+        return {"answer": f"{text} (Source: {r.get('source', 'web').title()}{', ' + r['url'] if r.get('url') else ''})",
+                "source": r.get("source", "web"), "title": title}
+    return None
 
 
 class TeacherUnavailable(Exception):
@@ -1452,6 +1603,22 @@ class Brain:
                     + (" and training on it in the background." if queued else "."))
             return {"reply": best.answer, "source": "knowledge", "confidence": round(conf, 4),
                     "notices": [note], "learned": False, "knowledge": best.id}
+        if self.cfg.web_first:  # free look-up before spending a cloud call
+            try:
+                found = wikipedia_answer(question)
+            except Exception as ex:
+                found, _ = None, log(f"web look-up failed: {ex}")
+            if found:
+                entry = self.kb.add(question, found["answer"], f"web:{found['source']}")
+                self.trainer.submit("learn", [entry.question])
+                self.report({"question": question, "reason": reason, "confidence": round(conf, 4), "status": "learned",
+                             "teacher": f"web:{found['source']}", "via": "web-first", "entry": entry.id,
+                             "answer_preview": found["answer"][:160]})
+                note = (f"🔔 Automatic report: Titan didn't know this yet, so it looked it up on "
+                        f"{found['source'].title()} ({found['title']}) instead of calling the cloud. "
+                        f"TITAN.md updated (entry #{entry.id}); training on it in the background.")
+                return {"reply": found["answer"], "source": f"web:{found['source']}", "confidence": round(conf, 4),
+                        "notices": [note], "learned": True, "entry": entry.id}
         return {**self.learn(question, hits, draft, conf, reason), "confidence": round(conf, 4)}
 
     # -- chat entry point (handles slash commands) ----------------------------------
@@ -1649,20 +1816,22 @@ UI_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Titan-23M</title>
 <meta name="description" content="Titan-23M: a free PyTorch AI (23M to 1.3B parameters) that learns what it doesn't know. Downloadable, or talk to it in the browser.">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Titan"%3E %3Cdefs%3E %3ClinearGradient id="titan-g" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse"%3E %3Cstop offset="0" stop-color="#5eead4"/%3E %3Cstop offset=".55" stop-color="#14b8a6"/%3E %3Cstop offset="1" stop-color="#0e7490"/%3E %3C/linearGradient%3E %3C/defs%3E %3Cpath d="M32 6 54.5 19v26L32 58 9.5 45V19Z" fill="url%28#titan-g%29" stroke="url%28#titan-g%29" stroke-width="7" stroke-linejoin="round"/%3E %3Cpath d="M20.5 24h23M32 24v19.5" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/%3E %3Cg fill="#fff"%3E%3Ccircle cx="20.5" cy="24" r="5.2"/%3E%3Ccircle cx="43.5" cy="24" r="5.2"/%3E%3Ccircle cx="32" cy="44" r="5.2"/%3E%3C/g%3E %3Cg fill="#0f766e"%3E%3Ccircle cx="20.5" cy="24" r="2"/%3E%3Ccircle cx="43.5" cy="24" r="2"/%3E%3Ccircle cx="32" cy="44" r="2"/%3E%3C/g%3E %3C/svg%3E">
+<meta name="theme-color" content="#0b1220">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#f6f7fb;--panel:#fff;--ink:#141826;--muted:#5d6475;--line:#e3e6ee;--accent:#4f46e5;--accent-ink:#fff;
---me:#4f46e5;--me-ink:#fff;--bot:#eef0f6;--note:#fff6db;--note-ink:#6b4e00;--err:#b42318;
---grad-a:#4f46e5;--grad-b:#0891b2;--glow-a:rgba(79,70,229,.18);--glow-b:rgba(8,145,178,.14);--chip:#eceefe;--code:#0f1220;--code-ink:#dfe3f5}
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;
---muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;--accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;
+:root{--bg:#f5f8f9;--panel:#fff;--ink:#0b2b34;--muted:#4f6670;--line:#dfe8ea;--accent:#0d9488;--accent-ink:#fff;
+--me:#0f766e;--me-ink:#fff;--bot:#ebf3f4;--note:#fff6db;--note-ink:#6b4e00;--err:#b42318;
+--grad-a:#0d9488;--grad-b:#0e7490;--glow-a:rgba(20,184,166,.20);--glow-b:rgba(14,116,144,.14);--chip:#e3f4f2;--code:#0b1220;--code-ink:#d8f3ef}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0b1220;--panel:#111b2c;--ink:#e6f1f3;
+--muted:#93a9b3;--line:#22324a;--accent:#2dd4bf;--accent-ink:#03201d;--me:#0f766e;--me-ink:#fff;--bot:#17253a;
 --note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80;
---grad-a:#a5b4fc;--grad-b:#67e8f9;--glow-a:rgba(99,102,241,.28);--glow-b:rgba(34,211,238,.16);--chip:#1f2333;--code:#0b0d14;--code-ink:#dfe3f5}}
-:root[data-theme="dark"]{--bg:#0f1117;--panel:#171a23;--ink:#e8eaf2;--muted:#9aa1b2;--line:#2a2f3c;--accent:#818cf8;
---accent-ink:#0f1117;--me:#6366f1;--me-ink:#fff;--bot:#212532;--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80;
---grad-a:#a5b4fc;--grad-b:#67e8f9;--glow-a:rgba(99,102,241,.28);--glow-b:rgba(34,211,238,.16);--chip:#1f2333;--code:#0b0d14;--code-ink:#dfe3f5}
+--grad-a:#5eead4;--grad-b:#22d3ee;--glow-a:rgba(45,212,191,.22);--glow-b:rgba(34,211,238,.14);--chip:#15243a;--code:#060b14;--code-ink:#d8f3ef}}
+:root[data-theme="dark"]{--bg:#0b1220;--panel:#111b2c;--ink:#e6f1f3;--muted:#93a9b3;--line:#22324a;--accent:#2dd4bf;
+--accent-ink:#03201d;--me:#0f766e;--me-ink:#fff;--bot:#17253a;--note:#3a2f10;--note-ink:#ffd978;--err:#ff8a80;
+--grad-a:#5eead4;--grad-b:#22d3ee;--glow-a:rgba(45,212,191,.22);--glow-b:rgba(34,211,238,.14);--chip:#15243a;--code:#060b14;--code-ink:#d8f3ef}
 *{box-sizing:border-box}html,body{margin:0;height:100%}
 body{background:var(--bg);color:var(--ink);font:15px/1.55 Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 .display{font-family:Unbounded,Inter,system-ui,sans-serif;letter-spacing:-.01em}
@@ -1715,7 +1884,9 @@ a{color:var(--accent)}
   background:color-mix(in srgb,var(--bg) 78%,transparent);border-bottom:1px solid var(--line)}
 .topbar .wrap{display:flex;align-items:center;gap:20px;height:60px}
 .logo{font-family:Unbounded,sans-serif;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none;display:flex;align-items:center;gap:8px}
-.logo i{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,var(--grad-a),var(--grad-b));display:inline-block}
+.logo svg{width:30px;height:30px;flex:none}.logo span{font-weight:700;letter-spacing:-.02em;text-transform:lowercase}
+.mark{display:inline-block;width:28px;height:28px;vertical-align:middle;flex:none}
+.hero-mark{width:84px;height:84px;display:block;margin:22px auto 0;filter:drop-shadow(0 12px 28px var(--glow-a))}
 .toplinks{display:flex;gap:18px;margin-left:auto}.toplinks a{color:var(--muted);text-decoration:none;font-size:14px}
 .toplinks a:hover{color:var(--ink)}
 @media(max-width:760px){.toplinks{display:none}.topbar .btn{margin-left:auto}}
@@ -1725,10 +1896,11 @@ a{color:var(--accent)}
 .btn-primary:hover{filter:brightness(1.08)}
 .btn-ghost{background:var(--panel);color:var(--ink);border-color:var(--line)}.btn-ghost:hover{border-color:var(--accent)}
 .btn-sm{padding:8px 14px;font-size:14px}
-.hero{position:relative;padding:84px 0 56px;text-align:center}
+.hero{position:relative;padding:44px 0 56px;text-align:center}
 .hero:before,.hero:after{content:"";position:absolute;z-index:-1;border-radius:50%;filter:blur(70px)}
 .hero:before{width:520px;height:420px;left:50%;top:-60px;transform:translateX(-85%);background:var(--glow-a)}
 .hero:after{width:460px;height:380px;left:50%;top:40px;transform:translateX(5%);background:var(--glow-b)}
+.hero .eyebrow{margin-top:22px}
 .eyebrow{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--chip);
   color:var(--muted);font-size:13px;border:1px solid var(--line)}
 .eyebrow b{color:var(--ink);font-weight:600}.eyebrow .dot{flex:none}
@@ -1800,13 +1972,14 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
 <body>
 <div id="home">
 <div class="topbar"><div class="wrap">
-  <a class="logo" href="#" aria-label="Titan-23M home"><i></i>TITAN</a>
+  <a class="logo" href="#" aria-label="Titan-23M home"><svg viewBox="0 0 64 64" aria-hidden="true"><defs> <linearGradient id="titan-g-nav" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse"> <stop offset="0" stop-color="#5eead4"/> <stop offset=".55" stop-color="#14b8a6"/> <stop offset="1" stop-color="#0e7490"/> </linearGradient> </defs> <path d="M32 6 54.5 19v26L32 58 9.5 45V19Z" fill="url(#titan-g-nav)" stroke="url(#titan-g-nav)" stroke-width="7" stroke-linejoin="round"/> <path d="M20.5 24h23M32 24v19.5" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/> <g fill="#fff"><circle cx="20.5" cy="24" r="5.2"/><circle cx="43.5" cy="24" r="5.2"/><circle cx="32" cy="44" r="5.2"/></g> <g fill="#0f766e"><circle cx="20.5" cy="24" r="2"/><circle cx="43.5" cy="24" r="2"/><circle cx="32" cy="44" r="2"/></g></svg><span>titan</span></a>
   <nav class="toplinks" aria-label="Sections"><a href="#features">Features</a><a href="#learn">How it learns</a><a href="#editions">Editions</a><a href="#generators">Generators</a><a href="#api">API</a></nav>
   <button class="btn btn-primary btn-sm" data-start>Start chatting</button>
 </div></div>
 
 <div class="wrap">
 <header class="hero">
+  <svg class="hero-mark" viewBox="0 0 64 64" aria-hidden="true"><defs> <linearGradient id="titan-g-hero" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse"> <stop offset="0" stop-color="#5eead4"/> <stop offset=".55" stop-color="#14b8a6"/> <stop offset="1" stop-color="#0e7490"/> </linearGradient> </defs> <path d="M32 6 54.5 19v26L32 58 9.5 45V19Z" fill="url(#titan-g-hero)" stroke="url(#titan-g-hero)" stroke-width="7" stroke-linejoin="round"/> <path d="M20.5 24h23M32 24v19.5" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/> <g fill="#fff"><circle cx="20.5" cy="24" r="5.2"/><circle cx="43.5" cy="24" r="5.2"/><circle cx="32" cy="44" r="5.2"/></g> <g fill="#0f766e"><circle cx="20.5" cy="24" r="2"/><circle cx="43.5" cy="24" r="2"/><circle cx="32" cy="44" r="2"/></g></svg>
   <span class="eyebrow"><span class="dot"></span><span><b>Free &amp; open source</b> · PyTorch · <span id="hEdition">online</span></span></span>
   <h1>Titan-23M</h1>
   <p class="lead">A free AI, from 23 million up to 1.3 billion parameters, that learns what it doesn't know. It keeps its memory in <b>TITAN.md</b>, and when it can't answer, its teacher <b>gpt-oss-120b</b> on Cloudflare teaches it.</p>
@@ -1945,7 +2118,7 @@ footer{color:var(--muted);font-size:13px;padding:36px 0 44px;text-align:center}
 <div class="app">
 <header>
   <a class="home-link" href="#" id="homeLink">← Home</a>
-  <h1>Titan-23M <small id="edition"></small></h1>
+  <h1><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><defs> <linearGradient id="titan-g-app" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse"> <stop offset="0" stop-color="#5eead4"/> <stop offset=".55" stop-color="#14b8a6"/> <stop offset="1" stop-color="#0e7490"/> </linearGradient> </defs> <path d="M32 6 54.5 19v26L32 58 9.5 45V19Z" fill="url(#titan-g-app)" stroke="url(#titan-g-app)" stroke-width="7" stroke-linejoin="round"/> <path d="M20.5 24h23M32 24v19.5" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/> <g fill="#fff"><circle cx="20.5" cy="24" r="5.2"/><circle cx="43.5" cy="24" r="5.2"/><circle cx="32" cy="44" r="5.2"/></g> <g fill="#0f766e"><circle cx="20.5" cy="24" r="2"/><circle cx="43.5" cy="24" r="2"/><circle cx="32" cy="44" r="2"/></g></svg> Titan-23M <small id="edition"></small></h1>
   <span class="status" id="status">connecting…</span>
 </header>
 <nav>

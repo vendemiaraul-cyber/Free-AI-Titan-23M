@@ -15,6 +15,7 @@ function fakeEnv(extra = {}) {
       put: async (k, v) => { kv.set(k, v); },
       list: async ({ prefix }) => ({ keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })) }),
     },
+    __search: async () => ({ results: [] }), // no real Wikipedia calls in tests
     ...extra,
   };
 }
@@ -114,4 +115,27 @@ test("entry module exports only the Worker (the runtime rejects other named expo
   const mod = await import("../src/index.js");
   assert.deepEqual(Object.keys(mod), ["default"]);
   assert.equal(typeof entry.fetch, "function");
+});
+
+test("reworded questions are answered from TITAN.md without any cloud call", async () => {
+  const env = fakeEnv();
+  for (const q of ["whats ur name", "who r u", "how do i make a video", "can you create pictures?", "thx", "what is pytorh"]) {
+    const r = await (await worker.fetch(post("/v1/chat", { message: q }), env, ctx)).json();
+    assert.equal(r.source, "knowledge", q);
+  }
+  assert.equal(env.calls.length, 0);
+});
+
+test("look-up questions use Wikipedia before the cloud teacher", async () => {
+  const env = fakeEnv({ __search: async (q) => ({ results: [{ title: "Alan Turing", url: "https://en.wikipedia.org/wiki/Alan_Turing",
+    snippet: "Alan Turing was an English mathematician. He was a pioneer of computer science.", source: "wikipedia" }] }) });
+  const r = await (await worker.fetch(post("/v1/chat", { message: "Who was Alan Turing?" }), env, ctx)).json();
+  assert.equal(r.source, "web:wikipedia");
+  assert.match(r.notices[0], /instead of calling the cloud/);
+  assert.equal(env.calls.length, 0);
+  assert.match(env.kv.get("titan.md"), /### Q: Who was Alan Turing\?/);
+  // a subject the article isn't about still goes to the teacher
+  const env2 = fakeEnv({ __search: async () => ({ results: [{ title: "Peru", snippet: "Peru is a country.", source: "wikipedia" }] }) });
+  const r2 = await (await worker.fetch(post("/v1/chat", { message: "What is the capital of Peru?" }), env2, ctx)).json();
+  assert.equal(r2.source, "cloud:@cf/openai/gpt-oss-120b");
 });

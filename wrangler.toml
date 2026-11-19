@@ -15,8 +15,9 @@ TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
 PERCHANCE_URL = "https://perchance.org/rg4m14ri"
 PUBLIC_CHAT = "true"
 RECALL_THRESHOLD = "0.55"
+# Answer "what is X" questions from Wikipedia before calling the cloud teacher
+WEB_FIRST = "true"
 
-# Optional: keep TITAN.md and reports permanently in Workers KV (without it they live in memory).
-# [[kv_namespaces]]
-# binding = "KNOWLEDGE"
-# id = "<your KV namespace id>"
+# Titan's permanent memory (TITAN.md + reports). No id needed: Cloudflare creates the namespace on deploy.
+[[kv_namespaces]]
+binding = "KNOWLEDGE"

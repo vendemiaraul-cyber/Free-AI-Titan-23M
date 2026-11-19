@@ -31,7 +31,7 @@ class FakeTeacher:
 def make_brain(home: Path) -> titan.Brain:
     shutil.copy(ROOT / "TITAN.md", home / "TITAN.md")
     cfg = titan.Config(home=home, model=TINY, auto_train=False, learn_steps=2, batch_size=2, web_fallback=False,
-                       perchance_url="")  # keep tests offline
+                       web_first=False, perchance_url="")  # keep tests offline
     b = titan.Brain(cfg)
     b.teacher = FakeTeacher()
     return b
@@ -174,6 +174,57 @@ class BrainTests(unittest.TestCase):
         r = titan.mcp_handle(self.b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                       "params": {"name": "titan_knowledge", "arguments": {"query": "teacher"}}})
         self.assertIn("gpt-oss-120b", r["result"]["content"][0]["text"])
+
+
+class RecallTests(unittest.TestCase):
+    """Reworded questions must be recalled from TITAN.md (no cloud call); unrelated ones must not."""
+    CASES = [
+        ("whats ur name", "What is your name?"), ("who r u", "Who are you?"), ("hii", "Hi"), ("helo", "Hello"),
+        ("hey", "Hey"), ("good morning", "Good morning"), ("how do i make a video", "How do I generate a video?"),
+        ("can you create pictures?", "How do I generate an image?"), ("who trains you", "Who is your teacher?"),
+        ("what is pytorh", "What is PyTorch?"), ("how many parametrs do you have", "How many parameters do you have?"),
+        ("thx", "Thank you"), ("bye", "Goodbye"), ("what can u do", "What can you do?"),
+        ("can you browse the internet", "Can you search the web?"), ("how can i teach you", "How do I teach you something myself?"),
+        ("who created you", "Who made you?"), ("what's MCP", "What is MCP?"),
+        ("what is the capital of peru", None), ("explain quantum entanglement", None), ("what is a cat", None),
+        ("how do i bake bread", None), ("who is the president of france", None),
+    ]
+
+    def test_recall(self):
+        kb = titan.KnowledgeBase(ROOT / "TITAN.md")
+        for q, want in self.CASES:
+            hits = kb.search(q, 1)
+            got = hits[0][1].question if hits and hits[0][0] >= 0.55 else None
+            self.assertEqual(got, want, q)
+
+    def test_wikipedia_first_only_for_matching_articles(self):
+        good = lambda subj, limit=3: {"results": [{"title": "Alan Turing", "url": "u", "source": "wikipedia",
+                                                   "snippet": "Alan Turing was a mathematician. He did a lot."}]}
+        self.assertIn("Alan Turing was a mathematician.", titan.wikipedia_answer("Who was Alan Turing?", good)["answer"])
+        self.assertIsNone(titan.wikipedia_answer("what is the capital of peru",
+                                                 lambda s, limit=3: {"results": [{"title": "Peru", "snippet": "Peru."}]}))
+        self.assertIsNone(titan.wikipedia_answer("how do i bake bread", good))
+
+    def test_brain_uses_web_before_cloud(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            b = make_brain(d)
+            b.cfg.web_first = True
+            real = titan.web_search
+            titan.web_search = lambda q, limit=3: {"results": [{"title": "Alan Turing", "url": "u", "source": "wikipedia",
+                                                                "snippet": "Alan Turing was a mathematician."}]}
+            try:
+                r = b.chat("Who was Alan Turing?")
+            finally:
+                titan.web_search = real
+            self.assertEqual(r["source"], "web:wikipedia")
+            self.assertEqual(b.teacher.calls, [])
+            self.assertIn("instead of calling the cloud", r["notices"][0])
+            again = b.chat("who was alan turing")   # now it's in TITAN.md
+            self.assertIn(again["source"], ("titan", "knowledge"))
+            wait_trainer(b)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class SizeTests(unittest.TestCase):

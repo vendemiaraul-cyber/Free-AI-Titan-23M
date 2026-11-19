@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 236 64" role="img" aria-label="titan">
+  <defs>
+    <linearGradient id="titan-w" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset=".55" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#0e7490"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 6 54.5 19v26L32 58 9.5 45V19Z" fill="url(#titan-w)" stroke="url(#titan-w)" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M20.5 24h23M32 24v19.5" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>
+  <g fill="#fff"><circle cx="20.5" cy="24" r="5.2"/><circle cx="43.5" cy="24" r="5.2"/><circle cx="32" cy="44" r="5.2"/></g>
+  <g fill="#0f766e"><circle cx="20.5" cy="24" r="2"/><circle cx="43.5" cy="24" r="2"/><circle cx="32" cy="44" r="2"/></g>
+  <text x="74" y="45" font-family="Unbounded, Inter, system-ui, sans-serif" font-size="38" font-weight="700" fill="#0b2b34" letter-spacing="-1">titan</text>
+</svg>
