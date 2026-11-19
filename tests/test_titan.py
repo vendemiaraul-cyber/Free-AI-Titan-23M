@@ -223,7 +223,10 @@ class HTTPTests(unittest.TestCase):
 
     def test_worker_ui_in_sync(self):
         ui_js = (ROOT / "cloudflare" / "src" / "ui.js").read_text()
-        self.assertIn(json.dumps(titan.UI_HTML), ui_js, "run python tools/build_worker_ui.py")
+        self.assertIn(json.dumps(titan.UI_HTML, ensure_ascii=False), ui_js, "run python tools/build_worker_ui.py")
+        seed_js = (ROOT / "cloudflare" / "src" / "seed.js").read_text()
+        self.assertIn(json.dumps((ROOT / "TITAN.md").read_text(), ensure_ascii=False), seed_js,
+                      "run python tools/build_worker_ui.py")
 
 
 if __name__ == "__main__":

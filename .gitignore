@@ -5,5 +5,7 @@ titan.tmp
 titan_reports.jsonl
 outputs/
 node_modules/
-cloudflare/.wrangler/
+
 .dev.vars
+.wrangler/
+package-lock.json

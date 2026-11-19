@@ -1,0 +1,22 @@
+# Free-AI-Titan-23M — Cloudflare edition (the browser UI + API + MCP)
+name = "free-ai-titan-23m"
+main = "cloudflare/src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = true
+
+[vars]
+TEACHER_MODEL = "@cf/openai/gpt-oss-120b"
+PERCHANCE_URL = "https://perchance.org/rg4m14ri"
+PUBLIC_CHAT = "true"
+RECALL_THRESHOLD = "0.55"
+
+# Optional: keep TITAN.md and reports permanently in Workers KV (without it they live in memory).
+# [[kv_namespaces]]
+# binding = "KNOWLEDGE"
+# id = "<your KV namespace id>"

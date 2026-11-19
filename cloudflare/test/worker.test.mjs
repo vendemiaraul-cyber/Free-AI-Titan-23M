@@ -1,7 +1,8 @@
 // Run with: node --test cloudflare/test/
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { DEFAULT_PERCHANCE_URL, parseEntries, searchEntries, upsertEntry, extractText, DEFAULT_MD } from "../src/index.js";
+import worker, { DEFAULT_PERCHANCE_URL, parseEntries, searchEntries, upsertEntry, extractText, DEFAULT_MD } from "../src/app.js";
+import entry from "../src/index.js";
 
 function fakeEnv(extra = {}) {
   const kv = new Map();
@@ -67,7 +68,7 @@ test("/v1/teach requires the key when set, and returns the answer for titan.py",
 
 test("knowledge merge, image, video, MCP and UI routes", async () => {
   const env = fakeEnv();
-  const m = await (await worker.fetch(post("/v1/knowledge", { markdown: upsertEntry(DEFAULT_MD, "Hello", "Hi!", "seed") }), env, ctx)).json();
+  const m = await (await worker.fetch(post("/v1/knowledge", { markdown: upsertEntry(DEFAULT_MD, "What is my test phrase?", "Hi from the merge test!", "seed") }), env, ctx)).json();
   assert.equal(m.added, 1);
   const img = await (await worker.fetch(post("/v1/image", { prompt: "a cat" }), env, ctx)).json();
   assert.equal(img.url, "https://perchance.org/rg4m14ri");
@@ -75,10 +76,42 @@ test("knowledge merge, image, video, MCP and UI routes", async () => {
   assert.equal((await worker.fetch(post("/v1/video", { prompt: "x" }), env, ctx)).status, 501);
   const tools = await (await worker.fetch(post("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list" }), env, ctx)).json();
   assert.ok(tools.result.tools.some((t) => t.name === "titan_chat"));
-  const call = await (await worker.fetch(post("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "titan_chat", arguments: { message: "hello" } } }), env, ctx)).json();
-  assert.match(call.result.content[0].text, /Hi!/);
+  const call = await (await worker.fetch(post("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "titan_chat", arguments: { message: "What is my test phrase?" } } }), env, ctx)).json();
+  assert.match(call.result.content[0].text, /merge test/);
   const ui = await worker.fetch(new Request("https://titan.example/"), env, ctx);
   assert.match(await ui.text(), /Titan-23M/);
   const h = await (await worker.fetch(new Request("https://titan.example/v1/health"), env, ctx)).json();
   assert.equal(h.teacher, "gpt-oss-120b");
+});
+
+test("zero-setup deploy: no KV binding, bundled TITAN.md answers, UI served", async () => {
+  const env = fakeEnv();
+  delete env.KNOWLEDGE;
+  const ui = await worker.fetch(new Request("https://titan.example/"), env, ctx);
+  assert.equal(ui.status, 200);
+  assert.match(await ui.text(), /Start chatting/);
+  const h = await (await worker.fetch(new Request("https://titan.example/v1/health"), env, ctx)).json();
+  assert.equal(h.storage, "memory");
+  assert.ok(h.knowledge_entries >= 20);
+  const r = await (await worker.fetch(post("/v1/chat", { message: "Who is your teacher?" }), env, ctx)).json();
+  assert.equal(r.source, "knowledge");
+  assert.match(r.reply, /gpt-oss-120b/);
+  const learned = await (await worker.fetch(post("/v1/chat", { message: "What is the capital of Peru?" }), env, ctx)).json();
+  assert.equal(learned.learned, true);
+  const again = await (await worker.fetch(post("/v1/chat", { message: "What is the capital of Peru?" }), env, ctx)).json();
+  assert.equal(again.source, "knowledge");
+});
+
+test("missing AI binding gives a clear error instead of crashing", async () => {
+  const env = fakeEnv();
+  delete env.AI;
+  const res = await worker.fetch(post("/v1/chat", { message: "Explain quantum entanglement" }), env, ctx);
+  assert.equal(res.status, 500);
+  assert.match((await res.json()).error, /Workers AI binding/);
+});
+
+test("entry module exports only the Worker (the runtime rejects other named exports)", async () => {
+  const mod = await import("../src/index.js");
+  assert.deepEqual(Object.keys(mod), ["default"]);
+  assert.equal(typeof entry.fetch, "function");
 });
