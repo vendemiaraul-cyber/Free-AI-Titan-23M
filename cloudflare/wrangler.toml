@@ -1,9 +1,4 @@
 # Free-AI-Titan-23M — Cloudflare edition
-# 1) npx wrangler kv namespace create KNOWLEDGE   -> paste the id below
-# 2) npx wrangler deploy
-# Optional secrets:
-#   npx wrangler secret put TITAN_API_KEY        # protects /v1/teach, /v1/knowledge (POST), /mcp, ...
-#   npx wrangler secret put REPORT_WEBHOOK_URL   # Discord/Slack webhook for the automatic reports
 name = "free-ai-titan-23m"
 main = "src/index.js"
 compatibility_date = "2025-09-01"

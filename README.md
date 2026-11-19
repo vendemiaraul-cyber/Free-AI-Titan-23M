@@ -64,22 +64,6 @@ python titan.py info
 If there's no `titan.pt` yet, `serve` and `chat` start a background bootstrap training
 automatically.
 
-### Connect it to the cloud teacher
-
-Either deploy the Worker (below) and set:
-
-```bash
-export TITAN_CLOUD_URL=https://free-ai-titan-23m.<your-subdomain>.workers.dev
-export TITAN_API_KEY=...          # if you set one on the worker
-```
-
-or skip the Worker and call Cloudflare's REST API directly:
-
-```bash
-export TITAN_CF_ACCOUNT_ID=...    # Cloudflare dashboard → Workers AI
-export TITAN_CF_API_TOKEN=...     # token with Workers AI permission
-```
-
 ### Images: Titan's Perchance generator
 
 Titan's image generator is **https://perchance.org/rg4m14ri**. It's the default, and the Image
@@ -128,17 +112,8 @@ or over HTTP at `http://127.0.0.1:8023/mcp` while `titan.py serve` runs.
 
 ## Cloudflare edition (`cloudflare/`)
 
-```bash
-cd cloudflare
-npx wrangler kv namespace create KNOWLEDGE      # paste the id into wrangler.toml
-npx wrangler secret put TITAN_API_KEY           # optional, protects teach/knowledge/MCP
-npx wrangler secret put REPORT_WEBHOOK_URL      # optional, Discord/Slack webhook for automatic reports
-npx wrangler deploy
-```
-
-Open the Worker URL to chat in the browser. Then run `python titan.py sync` once to upload your
-`TITAN.md` to the cloud. The UI is shared with `titan.py`: after editing `UI_HTML`, run
-`python tools/build_worker_ui.py`.
+The browser edition of Titan, running as a Cloudflare Worker. It shares the browser UI with
+`titan.py`: after editing `UI_HTML`, run `python tools/build_worker_ui.py`.
 
 ## API
 
@@ -169,8 +144,6 @@ node --test cloudflare/test/*.test.mjs # the Worker, with fake AI + KV
 | Variable | Default | Meaning |
 |---|---|---|
 | `TITAN_HOME` | folder of `titan.py` | where `TITAN.md`, `titan.pt`, reports and `outputs/` live |
-| `TITAN_CLOUD_URL`, `TITAN_API_KEY` | – | your Worker and its key |
-| `TITAN_CF_ACCOUNT_ID`, `TITAN_CF_API_TOKEN` | – | call Workers AI directly instead |
 | `TITAN_TEACHER_MODEL` | `@cf/openai/gpt-oss-120b` | the teacher |
 | `TITAN_WEB_FALLBACK` | `1` | learn from Wikipedia when the cloud is down |
 | `TITAN_PERCHANCE_URL` (+ `_PROMPT/_NEGATIVE/_BUTTON_SELECTOR`) | `https://perchance.org/rg4m14ri` | the Perchance image generator |
